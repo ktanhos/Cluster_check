@@ -3,16 +3,7 @@ import os
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "DATA-LAYER-TEST-2026-08-17-01"
-
-try:
-    from vnstock.config import Config
-    Config.REQUEST_TIMEOUT = 15
-    Config.RETRIES = 1
-    Config.BACKOFF_MIN = 1
-    Config.BACKOFF_MAX = 3
-except Exception:
-    pass
+APP_VERSION = "DATA-LAYER-FRESH-2026-08-17-01"
 
 from backtest import calculate_forward_returns, summarize_forward_returns
 from charts import behavior_map, cluster_count_chart, membership_count_chart, migration_heatmap
@@ -25,22 +16,28 @@ from migration import build_migration_table
 
 st.set_page_config(page_title="VN30 Rolling Behavior Clustering", layout="wide")
 st.title("VN30 Rolling Market Behavior Clustering")
-st.caption("Lớp dữ liệu và lớp mô hình được tách riêng. VNstock chỉ được gọi khi bấm Cập nhật dữ liệu. Sau đó có thể chạy nhiều cấu hình mô hình mà không gọi API lại.")
+st.caption("Lớp dữ liệu và lớp mô hình được tách riêng. Mỗi lần bấm Cập nhật dữ liệu sẽ tải một bộ dữ liệu VNstock mới. Sau đó có thể chạy nhiều cấu hình mô hình mà không gọi API lại.")
 st.caption(f"Phiên bản Data Layer: {APP_VERSION}")
 
 with st.sidebar:
     st.subheader("Xác thực VNstock")
-    api_key = st.text_input("VNstock API Key", value=st.session_state.get("vnstock_api_key", ""), type="password", placeholder="Dán API Key VNstock tại đây")
+    api_key = st.text_input(
+        "VNstock API Key",
+        value=st.session_state.get("vnstock_api_key", ""),
+        type="password",
+        placeholder="Dán API Key VNstock tại đây",
+    )
     if api_key:
         st.session_state["vnstock_api_key"] = api_key
     st.caption("API Key chỉ được giữ trong phiên Streamlit.")
     st.divider()
+
     st.subheader("Khoảng dữ liệu")
     start = st.date_input("Ngày bắt đầu", DEFAULT_START)
     end = st.date_input("Ngày kết thúc", DEFAULT_END)
     update_data = st.button("Cập nhật dữ liệu VNstock", type="primary", use_container_width=True)
-    clear_data = st.button("Xóa dữ liệu cache", use_container_width=True, help="Xóa dữ liệu đã lưu trong phiên Cloud. Chỉ dùng khi muốn tải lại từ đầu.")
     st.divider()
+
     st.subheader("Thiết lập mô hình")
     train_window = st.number_input("Cửa sổ rolling", min_value=60, max_value=504, value=DEFAULT_TRAIN_WINDOW, step=5)
     k = st.number_input("Số cụm K", min_value=2, max_value=8, value=DEFAULT_K, step=1)
@@ -54,17 +51,6 @@ api_key = st.session_state.get("vnstock_api_key", "").strip() or os.getenv("VNST
 if pd.Timestamp(start) >= pd.Timestamp(end):
     st.error("Ngày bắt đầu phải nhỏ hơn ngày kết thúc.")
     st.stop()
-
-if clear_data:
-    from data_loader import CACHE_DIR
-    for p in CACHE_DIR.glob("*.csv"):
-        try:
-            p.unlink()
-        except OSError:
-            pass
-    st.session_state.pop("market_data", None)
-    st.session_state.pop("model_result", None)
-    st.success("Đã xóa cache dữ liệu. Chưa có API nào được gọi.")
 
 if update_data:
     if not api_key:
@@ -88,23 +74,21 @@ if update_data:
             error_box.warning("Mã chưa tải được: " + " | ".join(error_messages[-5:]))
 
     try:
-        with st.spinner("Đang tải dữ liệu VNstock. Mỗi mã được xử lý độc lập; mã lỗi không làm treo toàn bộ danh sách."):
+        with st.spinner("Đang tải mới toàn bộ dữ liệu VNstock. Không sử dụng cache."):
             stock, index = load_market_data(
                 pd.Timestamp(start),
                 pd.Timestamp(end),
                 api_key=api_key,
                 progress_callback=on_progress,
-                force_refresh=False,
             )
         st.session_state["market_data"] = (stock, index)
         st.session_state.pop("model_result", None)
         progress.progress(1.0)
-        status_box.success(f"Đã sẵn sàng dữ liệu: {len(stock):,} dòng cổ phiếu và {len(index):,} dòng VNINDEX.")
-        detail_box.caption("Dữ liệu đã được lưu theo từng mã. Chạy mô hình không gọi VNstock.")
+        status_box.success(f"Đã tải xong dữ liệu mới: {len(stock):,} dòng cổ phiếu và {len(index):,} dòng VNINDEX.")
+        detail_box.caption("Bộ dữ liệu hiện nằm trong phiên Streamlit. Chạy mô hình sẽ không gọi VNstock.")
     except Exception as exc:
         status_box.error("Cập nhật dữ liệu chưa hoàn tất.")
         st.exception(exc)
-        st.warning("Các mã tải thành công vẫn được giữ lại. Bấm Cập nhật dữ liệu lần nữa để tiếp tục; hệ thống sẽ dùng cache và chỉ tải phần còn thiếu.")
         st.stop()
 
 if "market_data" not in st.session_state:
@@ -118,8 +102,19 @@ if run_model:
     try:
         with st.spinner("Đang tính feature, rolling clustering, migration và forward return..."):
             feature_panel = build_feature_panel(stock, index)
-            rolling_result, diagnostics = rolling_cluster(feature_panel, start=pd.Timestamp(start), end=pd.Timestamp(end), train_window=int(train_window), k=int(k), step=int(step))
-            migration = build_migration_table(rolling_result, confirmation_steps=int(confirmation_steps), confidence_threshold=float(confidence_threshold))
+            rolling_result, diagnostics = rolling_cluster(
+                feature_panel,
+                start=pd.Timestamp(start),
+                end=pd.Timestamp(end),
+                train_window=int(train_window),
+                k=int(k),
+                step=int(step),
+            )
+            migration = build_migration_table(
+                rolling_result,
+                confirmation_steps=int(confirmation_steps),
+                confidence_threshold=float(confidence_threshold),
+            )
             forward = calculate_forward_returns(stock, migration, horizons=(5, 10, 20))
             forward_summary = summarize_forward_returns(forward)
         st.session_state["model_result"] = (rolling_result, diagnostics, migration, forward_summary)
