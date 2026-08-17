@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
@@ -51,6 +52,16 @@ def _save_cache(symbol: str, df: pd.DataFrame) -> None:
     df.to_csv(_cache_path(symbol), index=False)
 
 
+def cache_status(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> str:
+    cached = _read_cache(symbol)
+    if cached is None:
+        return "Chưa có cache"
+    cached["time"] = pd.to_datetime(cached["time"])
+    if cached["time"].min() <= start and cached["time"].max() >= end:
+        return "Đã đủ cache"
+    return "Cache chưa đủ, cần cập nhật"
+
+
 def _configure_vnstock(api_key: str | None = None) -> None:
     key = (api_key or os.getenv("VNSTOCK_API_KEY", "")).strip()
     if not key:
@@ -77,7 +88,8 @@ def _call(fetch_fn, symbol: str) -> pd.DataFrame:
         return fetch_fn()
     except Exception as exc:
         error_type = type(exc).__name__
-        error_text = str(exc).replace(os.getenv("VNSTOCK_API_KEY", ""), "[API_KEY]")[:500]
+        key = os.getenv("VNSTOCK_API_KEY", "")
+        error_text = str(exc).replace(key, "[API_KEY]")[:500]
         raise RuntimeError(f"VNstock lỗi khi tải {symbol}. Loại lỗi: {error_type}. Chi tiết: {error_text}") from exc
 
 
@@ -109,42 +121,66 @@ def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     return _normalize_ohlcv(raw, "VNINDEX")
 
 
-def _load_symbol(symbol: str, fetch_start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    cached = _read_cache(symbol)
+def _load_symbol(symbol: str, fetch_start: pd.Timestamp, end: pd.Timestamp, force_refresh: bool = False) -> tuple[pd.DataFrame, bool]:
+    cached = None if force_refresh else _read_cache(symbol)
+    fetched = False
     if cached is None:
         cached = _fetch_equity(symbol, fetch_start, end)
+        fetched = True
     else:
         cached["time"] = pd.to_datetime(cached["time"])
         if fetch_start < cached["time"].min():
-            cached = pd.concat([cached, _fetch_equity(symbol, fetch_start, cached["time"].min() - pd.Timedelta(days=1))], ignore_index=True)
+            left = _fetch_equity(symbol, fetch_start, cached["time"].min() - pd.Timedelta(days=1))
+            cached = pd.concat([cached, left], ignore_index=True)
+            fetched = True
         if end > cached["time"].max():
-            cached = pd.concat([cached, _fetch_equity(symbol, cached["time"].max() + pd.Timedelta(days=1), end)], ignore_index=True)
+            right = _fetch_equity(symbol, cached["time"].max() + pd.Timedelta(days=1), end)
+            cached = pd.concat([cached, right], ignore_index=True)
+            fetched = True
     _save_cache(symbol, cached)
     cached = cached.sort_values("time").drop_duplicates("time", keep="last")
-    return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy()
+    return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy(), fetched
 
 
-def _load_index(fetch_start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    cached = _read_cache("VNINDEX")
+def _load_index(fetch_start: pd.Timestamp, end: pd.Timestamp, force_refresh: bool = False) -> tuple[pd.DataFrame, bool]:
+    cached = None if force_refresh else _read_cache("VNINDEX")
+    fetched = False
     if cached is None:
         cached = _fetch_index(fetch_start, end)
+        fetched = True
     else:
         cached["time"] = pd.to_datetime(cached["time"])
         if fetch_start < cached["time"].min():
-            cached = pd.concat([cached, _fetch_index(fetch_start, cached["time"].min() - pd.Timedelta(days=1))], ignore_index=True)
+            left = _fetch_index(fetch_start, cached["time"].min() - pd.Timedelta(days=1))
+            cached = pd.concat([cached, left], ignore_index=True)
+            fetched = True
         if end > cached["time"].max():
-            cached = pd.concat([cached, _fetch_index(cached["time"].max() + pd.Timedelta(days=1), end)], ignore_index=True)
+            right = _fetch_index(cached["time"].max() + pd.Timedelta(days=1), end)
+            cached = pd.concat([cached, right], ignore_index=True)
+            fetched = True
     _save_cache("VNINDEX", cached)
     cached = cached.sort_values("time").drop_duplicates("time", keep="last")
-    return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy()
+    return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy(), fetched
 
 
-def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80, api_key: str | None = None):
+def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80, api_key: str | None = None, progress_callback: Callable[[int, int, str, str], None] | None = None, force_refresh: bool = False):
     _configure_vnstock(api_key)
     fetch_start = start - pd.Timedelta(days=int(warmup * 1.7))
     symbols = symbols_for_period(fetch_start, end)
-    stock = pd.concat([_load_symbol(symbol, fetch_start, end) for symbol in symbols], ignore_index=True)
-    vn = _load_index(fetch_start, end)
+    total = len(symbols) + 1
+    stock_frames = []
+    for i, symbol in enumerate(symbols, 1):
+        status = cache_status(symbol, fetch_start, end) if not force_refresh else "Làm mới bắt buộc"
+        if progress_callback:
+            progress_callback(i - 1, total, symbol, status)
+        frame, fetched = _load_symbol(symbol, fetch_start, end, force_refresh=force_refresh)
+        stock_frames.append(frame)
+        if progress_callback:
+            progress_callback(i, total, symbol, "Đã tải API" if fetched else "Dùng cache")
+    vn, fetched = _load_index(fetch_start, end, force_refresh=force_refresh)
+    if progress_callback:
+        progress_callback(total, total, "VNINDEX", "Đã tải API" if fetched else "Dùng cache")
+    stock = pd.concat(stock_frames, ignore_index=True)
     for df in (stock, vn):
         df["time"] = pd.to_datetime(df["time"])
         for col in ["open", "high", "low", "close", "volume"]:
