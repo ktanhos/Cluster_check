@@ -48,9 +48,9 @@ def _state_profile(centers: np.ndarray) -> pd.DataFrame:
 
 def _state_names(profile: pd.DataFrame) -> dict[int, str]:
     ids = list(profile.index)
-    names: dict[int, str] = {}
     if not ids:
-        return names
+        return {}
+    names: dict[int, str] = {}
     momentum = profile["MomentumScore"]
     risk = profile["RiskScore"]
     leader = int(momentum.idxmax())
@@ -72,30 +72,25 @@ def rolling_cluster(panel: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
     all_dates = sorted(pd.to_datetime(panel["time"].dropna().unique()))
     all_dates = [pd.Timestamp(d) for d in all_dates if pd.Timestamp(d) <= end]
     observation_dates = [d for d in all_dates if d >= start]
+    selected_dates = observation_dates[::step]
+
     results = []
     diagnostics = []
     previous_centers = None
-    previous_state_names: dict[int, str] = {}
 
-    for current_date in observation_dates:
-        idx = all_dates.index(current_date)
-        if idx < train_window:
-            continue
-        if (len(results) // max(1, k)) % step != 0:
-            # This branch is intentionally replaced below by an explicit counter.
-            pass
-
-    selected_dates = observation_dates[::step]
     for current_date in selected_dates:
         idx = all_dates.index(current_date)
         if idx < train_window:
             continue
+
         train_dates = all_dates[idx - train_window:idx]
         train_parts = []
         for d in train_dates:
             active = membership_at(d)
-            train_parts.append(panel[(panel["time"] == d) & panel["Ticker"].isin(active)])
+            part = panel[(panel["time"] == d) & panel["Ticker"].isin(active)]
+            train_parts.append(part)
         train = pd.concat(train_parts, ignore_index=True).dropna(subset=Z_FEATURES)
+
         active_current = membership_at(current_date)
         current = panel[(panel["time"] == current_date) & panel["Ticker"].isin(active_current)].dropna(subset=Z_FEATURES).copy()
 
@@ -122,6 +117,7 @@ def rolling_cluster(panel: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
         profile = _state_profile(stable_centers)
         names = _state_names(profile)
         best, second, confidence = _assignment_metrics(X_current, stable_centers)
+
         current["Cluster"] = stable_labels_current
         current["ClusterLabel"] = current["Cluster"].map(names).fillna(current["Cluster"].map(lambda x: f"State {int(x)}"))
         current["CentroidDistance"] = best
@@ -131,6 +127,7 @@ def rolling_cluster(panel: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
         current["RiskScore"] = (current["Z_Volatility20"] + current["Z_Beta60"]) / 2
         current["FlowScore"] = current["Z_VolumeZ20"]
         current["Date"] = current_date
+
         results.append(current[["Date", "Ticker"] + FEATURES + Z_FEATURES + ["Cluster", "ClusterLabel", "CentroidDistance", "SecondCentroidDistance", "AssignmentConfidence", "MomentumScore", "RiskScore", "FlowScore"]])
 
         unique_train = len(np.unique(labels_train))
@@ -146,7 +143,6 @@ def rolling_cluster(panel: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
             "MeanCentroidDistance": float(np.mean(best)),
         })
         previous_centers = stable_centers
-        previous_state_names = names
 
     if not results:
         raise ValueError("Không đủ dữ liệu để chạy rolling clustering với cửa sổ đã chọn.")
