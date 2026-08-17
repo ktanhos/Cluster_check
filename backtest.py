@@ -43,13 +43,68 @@ def summarize_forward_returns(forward: pd.DataFrame) -> pd.DataFrame:
         for c in cols:
             horizon = c.replace("ForwardReturn", "")
             membership_col = f"ConstituentThrough{horizon}"
-            if membership_col in g:
-                valid = g[g[membership_col]]
-            else:
-                valid = g
+            valid = g[g[membership_col]] if membership_col in g else g
             row[f"{c}_EventsInBasket"] = len(valid)
             row[f"{c}_Mean"] = valid[c].mean()
             row[f"{c}_Median"] = valid[c].median()
             row[f"{c}_PositiveRate"] = (valid[c] > 0).mean() if len(valid) else np.nan
         rows.append(row)
     return pd.DataFrame(rows).sort_values("Events", ascending=False)
+
+
+def build_reference_forecast(stock: pd.DataFrame, rolling_result: pd.DataFrame, horizons=(5, 10, 20), min_history: int = 5) -> pd.DataFrame:
+    """Create a descriptive, historical conditional return ranking for the latest stocks.
+
+    This is deliberately a reference estimate, not a trained predictive model. Each current
+    stock is compared with historical observations of the same behavior group. Observations
+    whose future return is not yet known are excluded, preventing look-ahead from the latest date.
+    """
+    if rolling_result is None or rolling_result.empty:
+        return pd.DataFrame()
+    hist = calculate_forward_returns(stock, rolling_result, horizons=horizons)
+    if hist.empty:
+        return pd.DataFrame()
+    hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
+    latest_date = hist["Date"].max()
+    current = rolling_result.copy()
+    current["Date"] = pd.to_datetime(current["Date"], errors="coerce")
+    current = current[current["Date"] == current["Date"].max()].copy()
+    current = current.sort_values("CentroidDistance", na_position="last").drop_duplicates("Ticker")
+    current = current[current["Ticker"].isin(set(membership_at(current["Date"].max())))].copy()
+
+    rows = []
+    return_cols = [f"ForwardReturn{h}D" for h in horizons]
+    for _, cur in current.iterrows():
+        ticker = cur["Ticker"]
+        state = cur.get("ClusterLabel", f"Nhóm {int(cur['Cluster']) + 1}")
+        migration_type = cur.get("MigrationType", "Stable")
+        state_hist = hist[(hist["ClusterLabel"] == state) & (hist["Date"] < latest_date)].copy()
+        state_hist = state_hist[state_hist["Ticker"].isin(set(membership_at(hist["Date"].min())) | set(membership_at(latest_date)))]
+        transition_hist = state_hist[state_hist["MigrationType"] == migration_type]
+        out = {
+            "Ticker": ticker,
+            "CurrentGroup": state,
+            "CurrentStatus": migration_type,
+            "Confidence": cur.get("AssignmentConfidence", np.nan),
+            "HistoricalObservations": len(state_hist),
+            "SameStatusObservations": len(transition_hist),
+        }
+        weighted_scores = []
+        for h, c in zip(horizons, return_cols):
+            valid = state_hist[c].dropna()
+            out[f"HistoricalMean{h}D"] = valid.mean() if len(valid) else np.nan
+            out[f"HistoricalMedian{h}D"] = valid.median() if len(valid) else np.nan
+            out[f"PositiveRate{h}D"] = (valid > 0).mean() if len(valid) else np.nan
+            if len(valid) >= min_history:
+                weighted_scores.append(float(valid.mean()))
+            else:
+                weighted_scores.append(np.nan)
+        available = [x for x in weighted_scores if pd.notna(x)]
+        out["ReferenceScore"] = float(np.mean(available)) if available else np.nan
+        out["EnoughHistory"] = len(state_hist) >= min_history
+        rows.append(out)
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    result["Rank"] = result["ReferenceScore"].rank(method="min", ascending=False).astype("Int64")
+    return result.sort_values(["EnoughHistory", "ReferenceScore"], ascending=[False, False])
