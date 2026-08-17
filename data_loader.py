@@ -21,7 +21,8 @@ from membership import symbols_for_period
 
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
-REQUEST_INTERVAL_SECONDS = 1.05
+REQUEST_INTERVAL_SECONDS = 1.25
+MAX_ATTEMPTS = 3
 _last_request_at = 0.0
 _market = None
 
@@ -41,8 +42,11 @@ def _read_cache(symbol: str) -> pd.DataFrame | None:
     path = _cache_path(symbol)
     if not path.exists():
         return None
-    df = pd.read_csv(path, parse_dates=["time"])
-    return None if df.empty else df
+    try:
+        df = pd.read_csv(path, parse_dates=["time"])
+        return None if df.empty else df
+    except Exception:
+        return None
 
 
 def _save_cache(symbol: str, df: pd.DataFrame) -> None:
@@ -74,23 +78,38 @@ def _configure_vnstock(api_key: str | None = None) -> None:
             pass
 
 
-def _rate_limit_gate() -> None:
+def _rate_limit_gate(interval: float = REQUEST_INTERVAL_SECONDS) -> None:
     global _last_request_at
-    wait = REQUEST_INTERVAL_SECONDS - (time.monotonic() - _last_request_at)
+    wait = interval - (time.monotonic() - _last_request_at)
     if wait > 0:
         time.sleep(wait)
     _last_request_at = time.monotonic()
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    keys = ["429", "rate limit", "rate_limit", "quota", "too many", "limit exceeded", "requests per minute", "requests/min"]
+    return any(k in text for k in keys)
+
+
 def _call(fetch_fn, symbol: str) -> pd.DataFrame:
-    _rate_limit_gate()
-    try:
-        return fetch_fn()
-    except Exception as exc:
-        error_type = type(exc).__name__
-        key = os.getenv("VNSTOCK_API_KEY", "")
-        error_text = str(exc).replace(key, "[API_KEY]")[:500]
-        raise RuntimeError(f"VNstock lỗi khi tải {symbol}. Loại lỗi: {error_type}. Chi tiết: {error_text}") from exc
+    last_exc = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            _rate_limit_gate()
+            return fetch_fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= MAX_ATTEMPTS:
+                break
+            if _is_rate_limit_error(exc):
+                time.sleep(65)
+            else:
+                time.sleep(3 * attempt)
+    error_type = type(last_exc).__name__ if last_exc else "UnknownError"
+    key = os.getenv("VNSTOCK_API_KEY", "")
+    error_text = str(last_exc).replace(key, "[API_KEY]")[:700] if last_exc else "Không rõ nguyên nhân"
+    raise RuntimeError(f"VNstock lỗi khi tải {symbol}. Loại lỗi: {error_type}. Chi tiết: {error_text}") from last_exc
 
 
 def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -169,14 +188,23 @@ def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80, a
     symbols = symbols_for_period(fetch_start, end)
     total = len(symbols) + 1
     stock_frames = []
+    failed = []
     for i, symbol in enumerate(symbols, 1):
         status = cache_status(symbol, fetch_start, end) if not force_refresh else "Làm mới bắt buộc"
         if progress_callback:
             progress_callback(i - 1, total, symbol, status)
-        frame, fetched = _load_symbol(symbol, fetch_start, end, force_refresh=force_refresh)
-        stock_frames.append(frame)
-        if progress_callback:
-            progress_callback(i, total, symbol, "Đã tải API" if fetched else "Dùng cache")
+        try:
+            frame, fetched = _load_symbol(symbol, fetch_start, end, force_refresh=force_refresh)
+            stock_frames.append(frame)
+            if progress_callback:
+                progress_callback(i, total, symbol, "Đã tải API" if fetched else "Dùng cache")
+        except Exception as exc:
+            failed.append((symbol, str(exc)))
+            if progress_callback:
+                progress_callback(i, total, symbol, f"LỖI: {str(exc)[:250]}")
+    if failed:
+        details = "; ".join(f"{s}: {e}" for s, e in failed)
+        raise RuntimeError(f"Không tải được {len(failed)} mã: {details}")
     vn, fetched = _load_index(fetch_start, end, force_refresh=force_refresh)
     if progress_callback:
         progress_callback(total, total, "VNINDEX", "Đã tải API" if fetched else "Dùng cache")
