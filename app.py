@@ -1,3 +1,5 @@
+import os
+
 import streamlit as st
 import pandas as pd
 
@@ -23,9 +25,26 @@ st.caption(
 )
 
 with st.sidebar:
+    st.subheader("Xác thực VNstock")
+    st.caption(
+        "Nhập API Key VNstock để ứng dụng gọi dữ liệu. Key chỉ được giữ trong phiên chạy hiện tại và không được ghi vào GitHub."
+    )
+    api_key = st.text_input(
+        "VNstock API Key",
+        value=st.session_state.get("vnstock_api_key", ""),
+        type="password",
+        placeholder="Dán API Key VNstock tại đây",
+        help="Có thể lấy API Key từ tài khoản Vnstock.",
+    )
+    if api_key:
+        st.session_state["vnstock_api_key"] = api_key
+
+    st.divider()
     start = st.date_input("Ngày bắt đầu", DEFAULT_START)
     end = st.date_input("Ngày kết thúc", DEFAULT_END)
-    train_window = st.number_input("Cửa sổ rolling", min_value=60, max_value=504, value=DEFAULT_TRAIN_WINDOW, step=5)
+    train_window = st.number_input(
+        "Cửa sổ rolling", min_value=60, max_value=504, value=DEFAULT_TRAIN_WINDOW, step=5
+    )
     k = st.number_input("Số cụm K", min_value=2, max_value=8, value=DEFAULT_K, step=1)
     step = st.number_input("Bước cập nhật", min_value=1, max_value=20, value=DEFAULT_STEP, step=1)
     confirmation_steps = st.number_input(
@@ -49,24 +68,42 @@ if run:
         st.error("Ngày bắt đầu phải nhỏ hơn ngày kết thúc.")
         st.stop()
 
-    with st.spinner("Đang tải dữ liệu và tính toán..."):
-        stock, index = load_market_data(pd.Timestamp(start), pd.Timestamp(end))
-        feature_panel = build_feature_panel(stock, index)
-        rolling_result, diagnostics = rolling_cluster(
-            feature_panel,
-            start=pd.Timestamp(start),
-            end=pd.Timestamp(end),
-            train_window=int(train_window),
-            k=int(k),
-            step=int(step),
+    api_key = st.session_state.get("vnstock_api_key", "").strip()
+    if not api_key:
+        st.error("Chưa có VNstock API Key. Hãy nhập API Key ở thanh bên trước khi chạy.")
+        st.stop()
+
+    # Expose the key to vnstock without writing it to the repository or logs.
+    os.environ["VNSTOCK_API_KEY"] = api_key
+
+    try:
+        with st.spinner("Đang xác thực VNstock, tải dữ liệu và tính toán..."):
+            stock, index = load_market_data(
+                pd.Timestamp(start), pd.Timestamp(end), api_key=api_key
+            )
+            feature_panel = build_feature_panel(stock, index)
+            rolling_result, diagnostics = rolling_cluster(
+                feature_panel,
+                start=pd.Timestamp(start),
+                end=pd.Timestamp(end),
+                train_window=int(train_window),
+                k=int(k),
+                step=int(step),
+            )
+            migration = build_migration_table(
+                rolling_result,
+                confirmation_steps=int(confirmation_steps),
+                confidence_threshold=float(confidence_threshold),
+            )
+            forward = calculate_forward_returns(stock, migration, horizons=(5, 10, 20))
+            forward_summary = summarize_forward_returns(forward)
+    except Exception as exc:
+        st.error("Không thể lấy dữ liệu VNstock hoặc chạy mô hình.")
+        st.exception(exc)
+        st.info(
+            "Nếu lỗi liên quan đến xác thực hoặc giới hạn truy cập, hãy kiểm tra API Key VNstock và thử lại sau một khoảng ngắn. Ứng dụng đã giới hạn số lần gọi API và sử dụng cache để giảm tải."
         )
-        migration = build_migration_table(
-            rolling_result,
-            confirmation_steps=int(confirmation_steps),
-            confidence_threshold=float(confidence_threshold),
-        )
-        forward = calculate_forward_returns(stock, migration, horizons=(5, 10, 20))
-        forward_summary = summarize_forward_returns(forward)
+        st.stop()
 
     st.success(
         f"Hoàn tất. Có {rolling_result['Date'].nunique()} mốc nghiên cứu và {rolling_result['Ticker'].nunique()} mã."
@@ -120,4 +157,4 @@ if run:
         "text/csv",
     )
 else:
-    st.info("Chọn khoảng thời gian và tham số ở thanh bên rồi bấm Chạy nghiên cứu.")
+    st.info("Nhập API Key VNstock ở thanh bên, chọn khoảng thời gian và tham số rồi bấm Chạy nghiên cứu.")
