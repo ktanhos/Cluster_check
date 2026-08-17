@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 
-# Use the Community package, but bypass Unified UI for the primary OHLCV
-# request. Direct KBS/VCI adapters give us a controlled fallback path when a
-# single symbol causes Unified UI to wait or fail on Streamlit Cloud.
+# Community package. Direct adapters are used before Unified UI so a single
+# problematic symbol cannot keep the entire Streamlit data update waiting.
 try:
     from vnstock import Vnstock
 except ImportError:
@@ -28,7 +28,34 @@ from membership import symbols_for_period
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 REQUEST_INTERVAL_SECONDS = 1.1
+REQUEST_TIMEOUT_SECONDS = 18
 _last_request_at = 0.0
+
+
+class RequestTimeout(BaseException):
+    """Timeout deliberately outside Exception so vnstock retry wrappers cannot swallow it."""
+
+
+def _timeout_handler(signum, frame):
+    raise RequestTimeout()
+
+
+def _call_with_timeout(fn, seconds: int = REQUEST_TIMEOUT_SECONDS):
+    """Run one network call with a hard timeout on Streamlit Cloud/Linux.
+
+    signal is only used on the main thread. On Windows or environments where
+    SIGALRM is unavailable, the call simply uses the library's normal timeout.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        return fn()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    try:
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        return fn()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _cache_path(symbol: str) -> Path:
@@ -80,7 +107,7 @@ def _rate_limit_gate() -> None:
     _last_request_at = time.monotonic()
 
 
-def _safe_error(exc: Exception) -> str:
+def _safe_error(exc: BaseException) -> str:
     key = os.getenv("VNSTOCK_API_KEY", "")
     return str(exc).replace(key, "[API_KEY]")[:500]
 
@@ -105,10 +132,12 @@ def _legacy_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp, source:
     if Vnstock is None:
         raise RuntimeError("Phiên bản vnstock hiện tại không có Vnstock wrapper.")
     stock = Vnstock().stock(symbol=symbol, source=source)
-    raw = stock.quote.history(
-        start=start.strftime("%Y-%m-%d"),
-        end=end.strftime("%Y-%m-%d"),
-        interval="1D",
+    raw = _call_with_timeout(
+        lambda: stock.quote.history(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            interval="1D",
+        )
     )
     return _normalize_ohlcv(raw, symbol)
 
@@ -116,34 +145,34 @@ def _legacy_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp, source:
 def _market_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     if Market is None:
         raise RuntimeError("Không tìm thấy Market trong vnstock.")
-    raw = Market().equity(symbol).ohlcv(
-        start=start.strftime("%Y-%m-%d"),
-        end=end.strftime("%Y-%m-%d"),
-        interval="1D",
+    raw = _call_with_timeout(
+        lambda: Market().equity(symbol).ohlcv(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            interval="1D",
+        )
     )
     return _normalize_ohlcv(raw, symbol)
 
 
 def _fetch_equity(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Fetch one symbol with direct provider fallback.
-
-    KBS and VCI are both documented equity market sources. We try the direct
-    adapters first, then Unified UI only as a last resort. This prevents one
-    problematic Unified UI route from being the only path for the entire data
-    update.
-    """
     errors = []
     for source in ("KBS", "VCI"):
         _rate_limit_gate()
         try:
             return _legacy_history(symbol, start, end, source)
+        except RequestTimeout:
+            errors.append(f"{source}: timeout {REQUEST_TIMEOUT_SECONDS}s")
         except Exception as exc:
             errors.append(f"{source}: {_safe_error(exc)}")
 
+    # Final fallback for installations where the legacy adapter is unavailable.
     if Market is not None:
         _rate_limit_gate()
         try:
             return _market_history(symbol, start, end)
+        except RequestTimeout:
+            errors.append(f"Unified: timeout {REQUEST_TIMEOUT_SECONDS}s")
         except Exception as exc:
             errors.append(f"Unified: {_safe_error(exc)}")
 
@@ -157,24 +186,32 @@ def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
             _rate_limit_gate()
             try:
                 stock = Vnstock().stock(symbol="VNINDEX", source=source)
-                raw = stock.quote.history(
-                    start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
-                    interval="1D",
+                raw = _call_with_timeout(
+                    lambda: stock.quote.history(
+                        start=start.strftime("%Y-%m-%d"),
+                        end=end.strftime("%Y-%m-%d"),
+                        interval="1D",
+                    )
                 )
                 return _normalize_ohlcv(raw, "VNINDEX")
+            except RequestTimeout:
+                errors.append(f"{source}: timeout {REQUEST_TIMEOUT_SECONDS}s")
             except Exception as exc:
                 errors.append(f"{source}: {_safe_error(exc)}")
 
     if Market is not None:
         _rate_limit_gate()
         try:
-            raw = Market().index("VNINDEX").ohlcv(
-                start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                interval="1D",
+            raw = _call_with_timeout(
+                lambda: Market().index("VNINDEX").ohlcv(
+                    start=start.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
+                    interval="1D",
+                )
             )
             return _normalize_ohlcv(raw, "VNINDEX")
+        except RequestTimeout:
+            errors.append(f"Unified: timeout {REQUEST_TIMEOUT_SECONDS}s")
         except Exception as exc:
             errors.append(f"Unified: {_safe_error(exc)}")
 
@@ -251,10 +288,10 @@ def load_market_data(
             stock_frames.append(frame)
             if progress_callback:
                 progress_callback(i, total, symbol, "Đã tải API" if fetched else "Dùng cache")
-        except Exception as exc:
-            failed.append((symbol, str(exc)))
+        except BaseException as exc:
+            failed.append((symbol, str(exc) or "Request timeout"))
             if progress_callback:
-                progress_callback(i, total, symbol, f"LỖI: {str(exc)[:350]}")
+                progress_callback(i, total, symbol, f"LỖI: {str(exc)[:350] or 'Request timeout'}")
             continue
 
     if failed:
