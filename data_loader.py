@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 import time
 from pathlib import Path
@@ -14,10 +13,6 @@ CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 REQUEST_INTERVAL_SECONDS = 1.1
 REQUEST_TIMEOUT_SECONDS = 25
-
-
-class WorkerTimeout(Exception):
-    pass
 
 
 def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -36,76 +31,46 @@ def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df.assign(symbol=symbol)
 
 
-def _worker_equity(queue, symbol: str, start: str, end: str, source: str, api_key: str):
-    """Run VNstock in a real child process.
+def _fetch_with_vnstock(symbol: str, start: pd.Timestamp, end: pd.Timestamp, source: str) -> pd.DataFrame:
+    """Call VNstock directly in the Streamlit execution thread.
 
-    Streamlit executes the user script in a worker thread rather than the
-    interpreter main thread. VNstock's internal timeout implementation uses
-    signal.signal, which Python only permits in the main thread. A child
-    process gives VNstock an actual interpreter main thread and therefore
-    avoids: "signal only works in main thread of the main interpreter".
+    We intentionally do not install an application-level signal timeout here.
+    VNstock itself uses signal based retry/timeout logic, which is incompatible
+    with Streamlit's worker thread and caused the previous
+    'signal only works in main thread' failure.
     """
-    try:
-        os.environ["VNSTOCK_API_KEY"] = api_key
+    from vnstock import Vnstock
+
+    os.environ["VNSTOCK_API_KEY"] = os.getenv("VNSTOCK_API_KEY", "")
+    stock = Vnstock().stock(symbol=symbol, source=source)
+    raw = stock.quote.history(
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        interval="1D",
+    )
+    return _normalize_ohlcv(raw, symbol)
+
+
+def _fetch_equity(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    errors = []
+    for source in ("KBS", "VCI"):
+        _rate_limit_gate()
         try:
-            from vnstock.config import Config
-            Config.REQUEST_TIMEOUT = 15
-            Config.RETRIES = 1
-            Config.BACKOFF_MIN = 1
-            Config.BACKOFF_MAX = 2
-        except Exception:
-            pass
-
-        from vnstock import Vnstock
-
-        stock = Vnstock().stock(symbol=symbol, source=source)
-        raw = stock.quote.history(start=start, end=end, interval="1D")
-        queue.put((True, _normalize_ohlcv(raw, symbol), ""))
-    except BaseException as exc:
-        queue.put((False, None, f"{type(exc).__name__}: {str(exc)[:500]}"))
+            return _fetch_with_vnstock(symbol, start, end, source)
+        except Exception as exc:
+            errors.append(f"{source}: {_safe_error(exc)}")
+    raise RuntimeError(f"VNstock không lấy được {symbol}: " + " | ".join(errors))
 
 
-def _worker_index(queue, start: str, end: str, source: str, api_key: str):
-    try:
-        os.environ["VNSTOCK_API_KEY"] = api_key
+def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    errors = []
+    for source in ("KBS", "VCI"):
+        _rate_limit_gate()
         try:
-            from vnstock.config import Config
-            Config.REQUEST_TIMEOUT = 15
-            Config.RETRIES = 1
-            Config.BACKOFF_MIN = 1
-            Config.BACKOFF_MAX = 2
-        except Exception:
-            pass
-
-        from vnstock import Vnstock
-
-        stock = Vnstock().stock(symbol="VNINDEX", source=source)
-        raw = stock.quote.history(start=start, end=end, interval="1D")
-        queue.put((True, _normalize_ohlcv(raw, "VNINDEX"), ""))
-    except BaseException as exc:
-        queue.put((False, None, f"{type(exc).__name__}: {str(exc)[:500]}"))
-
-
-def _run_worker(target, args, timeout: int = REQUEST_TIMEOUT_SECONDS):
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    process = ctx.Process(target=target, args=(queue, *args))
-    process.daemon = True
-    process.start()
-    process.join(timeout)
-
-    if process.is_alive():
-        process.terminate()
-        process.join(5)
-        return None, f"timeout {timeout}s"
-
-    if queue.empty():
-        return None, f"worker exited with code {process.exitcode} without a result"
-
-    ok, data, error = queue.get()
-    if ok:
-        return data, ""
-    return None, error
+            return _fetch_with_vnstock("VNINDEX", start, end, source)
+        except Exception as exc:
+            errors.append(f"{source}: {_safe_error(exc)}")
+    raise RuntimeError("VNstock không lấy được VNINDEX: " + " | ".join(errors))
 
 
 def _cache_path(symbol: str) -> Path:
@@ -160,34 +125,6 @@ def _rate_limit_gate() -> None:
 def _safe_error(exc: BaseException) -> str:
     key = os.getenv("VNSTOCK_API_KEY", "")
     return str(exc).replace(key, "[API_KEY]")[:500]
-
-
-def _fetch_equity(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    errors = []
-    for source in ("KBS", "VCI"):
-        _rate_limit_gate()
-        data, error = _run_worker(
-            _worker_equity,
-            (symbol, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), source, os.getenv("VNSTOCK_API_KEY", "")),
-        )
-        if data is not None:
-            return data
-        errors.append(f"{source}: {error}")
-    raise RuntimeError(f"VNstock không lấy được {symbol}: " + " | ".join(errors))
-
-
-def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    errors = []
-    for source in ("KBS", "VCI"):
-        _rate_limit_gate()
-        data, error = _run_worker(
-            _worker_index,
-            (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), source, os.getenv("VNSTOCK_API_KEY", "")),
-        )
-        if data is not None:
-            return data
-        errors.append(f"{source}: {error}")
-    raise RuntimeError("VNstock không lấy được VNINDEX: " + " | ".join(errors))
 
 
 def _load_symbol(symbol: str, fetch_start: pd.Timestamp, end: pd.Timestamp, force_refresh: bool = False) -> tuple[pd.DataFrame, bool]:
