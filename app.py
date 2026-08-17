@@ -1,8 +1,11 @@
 import os
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
+from backtest import calculate_forward_returns, summarize_forward_returns
+from charts import behavior_map, cluster_count_chart, migration_heatmap
+from clustering import rolling_cluster
 from config import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_CONFIRMATION_STEPS,
@@ -14,53 +17,35 @@ from config import (
 )
 from data_loader import load_market_data
 from features import build_feature_panel
-from clustering import rolling_cluster
+from membership import change_table
 from migration import build_migration_table
-from backtest import calculate_forward_returns, summarize_forward_returns
 
 st.set_page_config(page_title="VN30 Rolling Behavior Clustering", layout="wide")
 st.title("VN30 Rolling Market Behavior Clustering")
-st.caption(
-    "Rolling clustering trên dữ liệu giá và khối lượng. Feature space được chuẩn hóa theo từng ngày để giữ hình học ổn định giữa các cửa sổ."
-)
+st.caption("Rolling clustering trên giá và khối lượng, có điều chỉnh theo lịch sử thành phần rổ VN30.")
 
 with st.sidebar:
     st.subheader("Xác thực VNstock")
-    st.caption(
-        "Nhập API Key VNstock để ứng dụng gọi dữ liệu. Key chỉ được giữ trong phiên chạy hiện tại và không được ghi vào GitHub."
-    )
     api_key = st.text_input(
         "VNstock API Key",
         value=st.session_state.get("vnstock_api_key", ""),
         type="password",
         placeholder="Dán API Key VNstock tại đây",
-        help="Có thể lấy API Key từ tài khoản Vnstock.",
+        help="API Key chỉ được giữ trong phiên chạy và không được ghi vào GitHub.",
     )
     if api_key:
         st.session_state["vnstock_api_key"] = api_key
+    st.caption("Có thể dùng Streamlit Secrets với khóa VNSTOCK_API_KEY thay cho ô nhập.")
 
     st.divider()
+    st.subheader("Thiết lập nghiên cứu")
     start = st.date_input("Ngày bắt đầu", DEFAULT_START)
     end = st.date_input("Ngày kết thúc", DEFAULT_END)
-    train_window = st.number_input(
-        "Cửa sổ rolling", min_value=60, max_value=504, value=DEFAULT_TRAIN_WINDOW, step=5
-    )
+    train_window = st.number_input("Cửa sổ rolling", min_value=60, max_value=504, value=DEFAULT_TRAIN_WINDOW, step=5)
     k = st.number_input("Số cụm K", min_value=2, max_value=8, value=DEFAULT_K, step=1)
     step = st.number_input("Bước cập nhật", min_value=1, max_value=20, value=DEFAULT_STEP, step=1)
-    confirmation_steps = st.number_input(
-        "Số mốc để xác nhận migration",
-        min_value=1,
-        max_value=5,
-        value=DEFAULT_CONFIRMATION_STEPS,
-        step=1,
-    )
-    confidence_threshold = st.slider(
-        "Ngưỡng confidence",
-        min_value=0.0,
-        max_value=0.9,
-        value=DEFAULT_CONFIDENCE_THRESHOLD,
-        step=0.05,
-    )
+    confirmation_steps = st.number_input("Số mốc để xác nhận migration", min_value=1, max_value=5, value=DEFAULT_CONFIRMATION_STEPS, step=1)
+    confidence_threshold = st.slider("Ngưỡng confidence", min_value=0.0, max_value=0.9, value=DEFAULT_CONFIDENCE_THRESHOLD, step=0.05)
     run = st.button("Chạy nghiên cứu", type="primary", use_container_width=True)
 
 if run:
@@ -68,19 +53,14 @@ if run:
         st.error("Ngày bắt đầu phải nhỏ hơn ngày kết thúc.")
         st.stop()
 
-    api_key = st.session_state.get("vnstock_api_key", "").strip()
+    api_key = st.session_state.get("vnstock_api_key", "").strip() or os.getenv("VNSTOCK_API_KEY", "").strip()
     if not api_key:
-        st.error("Chưa có VNstock API Key. Hãy nhập API Key ở thanh bên trước khi chạy.")
+        st.error("Chưa có VNstock API Key. Hãy nhập API Key ở thanh bên hoặc cấu hình VNSTOCK_API_KEY trong Streamlit Secrets.")
         st.stop()
 
-    # Expose the key to vnstock without writing it to the repository or logs.
-    os.environ["VNSTOCK_API_KEY"] = api_key
-
     try:
-        with st.spinner("Đang xác thực VNstock, tải dữ liệu và tính toán..."):
-            stock, index = load_market_data(
-                pd.Timestamp(start), pd.Timestamp(end), api_key=api_key
-            )
+        with st.spinner("Đang tải dữ liệu, tính feature và chạy rolling clustering..."):
+            stock, index = load_market_data(pd.Timestamp(start), pd.Timestamp(end), api_key=api_key)
             feature_panel = build_feature_panel(stock, index)
             rolling_result, diagnostics = rolling_cluster(
                 feature_panel,
@@ -100,61 +80,46 @@ if run:
     except Exception as exc:
         st.error("Không thể lấy dữ liệu VNstock hoặc chạy mô hình.")
         st.exception(exc)
-        st.info(
-            "Nếu lỗi liên quan đến xác thực hoặc giới hạn truy cập, hãy kiểm tra API Key VNstock và thử lại sau một khoảng ngắn. Ứng dụng đã giới hạn số lần gọi API và sử dụng cache để giảm tải."
-        )
+        st.info("Kiểm tra API Key, giới hạn truy cập và dữ liệu cache rồi thử lại.")
         st.stop()
 
-    st.success(
-        f"Hoàn tất. Có {rolling_result['Date'].nunique()} mốc nghiên cứu và {rolling_result['Ticker'].nunique()} mã."
-    )
-
+    st.success(f"Hoàn tất. Có {rolling_result['Date'].nunique()} mốc nghiên cứu và 30 mã thành phần tại mỗi mốc.")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Mốc nghiên cứu", int(rolling_result["Date"].nunique()))
     col2.metric("Migration thô", int(migration["Migration"].sum()))
     col3.metric("Migration xác nhận", int(migration["MigrationConfirmed"].sum()))
     col4.metric("Confidence TB", f"{migration['AssignmentConfidence'].mean():.2f}")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Trạng thái", "Migration", "Forward Return", "Chẩn đoán"]
-    )
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Behavior Map", "Migration", "Thành phần VN30", "Forward Return", "Chẩn đoán"])
 
     with tab1:
-        latest = rolling_result[rolling_result["Date"] == rolling_result["Date"].max()].copy()
+        latest_date = rolling_result["Date"].max()
+        latest = rolling_result[rolling_result["Date"] == latest_date].copy()
+        st.plotly_chart(behavior_map(latest, f"Biểu đồ hành vi VN30 tại {latest_date:%d/%m/%Y}"), use_container_width=True)
+        st.plotly_chart(cluster_count_chart(rolling_result), use_container_width=True)
         st.dataframe(latest.sort_values(["Cluster", "Ticker"]), use_container_width=True)
 
     with tab2:
-        st.dataframe(
-            migration.sort_values(["Date", "Ticker"]),
-            use_container_width=True,
-        )
-        st.caption(
-            "Migration thô ghi nhận mọi thay đổi trạng thái. Migration xác nhận yêu cầu trạng thái mới tồn tại đủ số mốc đã chọn và vượt ngưỡng confidence."
-        )
+        changes = change_table()
+        change_dates = [d for d in changes["EffectiveDate"].tolist() if pd.Timestamp(start) <= d <= pd.Timestamp(end)]
+        st.plotly_chart(migration_heatmap(migration, change_dates), use_container_width=True)
+        st.dataframe(migration.sort_values(["Date", "Ticker"]), use_container_width=True)
+        st.caption("Vùng trống trên heatmap là thời gian mã chưa thuộc rổ VN30. Đường đỏ đánh dấu ngày thay đổi thành phần.")
 
     with tab3:
-        st.dataframe(forward_summary, use_container_width=True)
-        st.info(
-            "Forward Return hiện là event study mô tả. Chưa phải kiểm định alpha hoàn chỉnh và chưa điều chỉnh transaction cost."
-        )
+        st.subheader("Lịch sử thay đổi thành phần")
+        st.dataframe(change_table(), use_container_width=True)
+        st.info("Rolling clustering chỉ sử dụng các mã đang thuộc rổ VN30 tại từng ngày. Mã bị loại dừng tham gia từ ngày hiệu lực; mã mới bắt đầu tham gia từ ngày hiệu lực.")
 
     with tab4:
-        st.dataframe(diagnostics, use_container_width=True)
-        st.caption(
-            "Assignment Confidence càng cao thì điểm quan sát càng nằm rõ về một centroid thay vì nằm gần ranh giới giữa hai trạng thái."
-        )
+        st.dataframe(forward_summary, use_container_width=True)
+        st.info("Forward Return hiện là event study mô tả. Chưa phải kiểm định alpha hoàn chỉnh và chưa điều chỉnh chi phí giao dịch.")
 
-    st.download_button(
-        "Tải toàn bộ trạng thái CSV",
-        rolling_result.to_csv(index=False).encode("utf-8-sig"),
-        "rolling_clusters.csv",
-        "text/csv",
-    )
-    st.download_button(
-        "Tải Migration CSV",
-        migration.to_csv(index=False).encode("utf-8-sig"),
-        "migration.csv",
-        "text/csv",
-    )
+    with tab5:
+        st.dataframe(diagnostics, use_container_width=True)
+        st.caption("Confidence cao nghĩa là điểm quan sát nằm rõ gần centroid của trạng thái được gán; confidence thấp nghĩa là gần ranh giới giữa các trạng thái.")
+
+    st.download_button("Tải toàn bộ trạng thái CSV", rolling_result.to_csv(index=False).encode("utf-8-sig"), "rolling_clusters.csv", "text/csv")
+    st.download_button("Tải Migration CSV", migration.to_csv(index=False).encode("utf-8-sig"), "migration.csv", "text/csv")
 else:
     st.info("Nhập API Key VNstock ở thanh bên, chọn khoảng thời gian và tham số rồi bấm Chạy nghiên cứu.")
