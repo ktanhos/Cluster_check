@@ -3,10 +3,10 @@ import os
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "DATA-LAYER-FRESH-2026-08-17-01"
+APP_VERSION = "DATA-LAYER-FRESH-2026-08-17-02"
 
 from backtest import calculate_forward_returns, summarize_forward_returns
-from charts import behavior_map, cluster_count_chart, membership_count_chart, migration_heatmap
+from charts import behavior_map, cluster_count_chart, migration_heatmap
 from clustering import rolling_cluster
 from config import DEFAULT_CONFIDENCE_THRESHOLD, DEFAULT_CONFIRMATION_STEPS, DEFAULT_END, DEFAULT_K, DEFAULT_START, DEFAULT_STEP, DEFAULT_TRAIN_WINDOW
 from data_loader import load_market_data
@@ -21,12 +21,7 @@ st.caption(f"Phiên bản Data Layer: {APP_VERSION}")
 
 with st.sidebar:
     st.subheader("Xác thực VNstock")
-    api_key = st.text_input(
-        "VNstock API Key",
-        value=st.session_state.get("vnstock_api_key", ""),
-        type="password",
-        placeholder="Dán API Key VNstock tại đây",
-    )
+    api_key = st.text_input("VNstock API Key", value=st.session_state.get("vnstock_api_key", ""), type="password", placeholder="Dán API Key VNstock tại đây")
     if api_key:
         st.session_state["vnstock_api_key"] = api_key
     st.caption("API Key chỉ được giữ trong phiên Streamlit.")
@@ -75,12 +70,7 @@ if update_data:
 
     try:
         with st.spinner("Đang tải mới toàn bộ dữ liệu VNstock. Không sử dụng cache."):
-            stock, index = load_market_data(
-                pd.Timestamp(start),
-                pd.Timestamp(end),
-                api_key=api_key,
-                progress_callback=on_progress,
-            )
+            stock, index = load_market_data(pd.Timestamp(start), pd.Timestamp(end), api_key=api_key, progress_callback=on_progress)
         st.session_state["market_data"] = (stock, index)
         st.session_state.pop("model_result", None)
         progress.progress(1.0)
@@ -102,19 +92,8 @@ if run_model:
     try:
         with st.spinner("Đang tính feature, rolling clustering, migration và forward return..."):
             feature_panel = build_feature_panel(stock, index)
-            rolling_result, diagnostics = rolling_cluster(
-                feature_panel,
-                start=pd.Timestamp(start),
-                end=pd.Timestamp(end),
-                train_window=int(train_window),
-                k=int(k),
-                step=int(step),
-            )
-            migration = build_migration_table(
-                rolling_result,
-                confirmation_steps=int(confirmation_steps),
-                confidence_threshold=float(confidence_threshold),
-            )
+            rolling_result, diagnostics = rolling_cluster(feature_panel, start=pd.Timestamp(start), end=pd.Timestamp(end), train_window=int(train_window), k=int(k), step=int(step))
+            migration = build_migration_table(rolling_result, confirmation_steps=int(confirmation_steps), confidence_threshold=float(confidence_threshold))
             forward = calculate_forward_returns(stock, migration, horizons=(5, 10, 20))
             forward_summary = summarize_forward_returns(forward)
         st.session_state["model_result"] = (rolling_result, diagnostics, migration, forward_summary)
@@ -131,8 +110,6 @@ if "model_result" in st.session_state:
     st.plotly_chart(cluster_count_chart(rolling_result), use_container_width=True)
     st.subheader("Migration Heatmap")
     st.plotly_chart(migration_heatmap(migration), use_container_width=True)
-    st.subheader("Thành phần VN30")
-    st.plotly_chart(membership_count_chart(pd.Timestamp(start), pd.Timestamp(end)), use_container_width=True)
     st.subheader("Forward Return")
     st.dataframe(forward_summary, use_container_width=True)
     st.subheader("Migration Detail")
