@@ -29,6 +29,7 @@ def _read_cache(symbol: str) -> pd.DataFrame | None:
 def _save_cache(symbol: str, df: pd.DataFrame) -> None:
     df = df.copy()
     df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time").drop_duplicates("time", keep="last")
     df.to_csv(_cache_path(symbol), index=False)
 
 
@@ -41,8 +42,7 @@ def _fetch_ohlcv(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Data
     df = raw.copy()
     if df.empty:
         raise ValueError(f"Không có dữ liệu cho {symbol}")
-    rename = {"date": "time", "Date": "time"}
-    df = df.rename(columns=rename)
+    df = df.rename(columns={"date": "time", "Date": "time"})
     required = ["time", "open", "high", "low", "close", "volume"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -52,14 +52,28 @@ def _fetch_ohlcv(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Data
 
 def _load_symbol(symbol: str, fetch_start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     cached = _read_cache(symbol)
-    if cached is not None:
+    if cached is None:
+        fetched = _fetch_ohlcv(symbol, fetch_start, end)
+        _save_cache(symbol, fetched)
+        time.sleep(0.4)
+        cached = _read_cache(symbol)
+    else:
         cached["time"] = pd.to_datetime(cached["time"])
-        if cached["time"].min() <= fetch_start and cached["time"].max() >= end:
-            return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy()
-    df = _fetch_ohlcv(symbol, fetch_start, end)
-    _save_cache(symbol, df)
-    time.sleep(0.4)
-    return df
+        missing_left = fetch_start < cached["time"].min()
+        missing_right = end > cached["time"].max()
+
+        if missing_left:
+            left = _fetch_ohlcv(symbol, fetch_start, cached["time"].min())
+            cached = pd.concat([cached, left], ignore_index=True)
+            time.sleep(0.4)
+        if missing_right:
+            right = _fetch_ohlcv(symbol, cached["time"].max(), end)
+            cached = pd.concat([cached, right], ignore_index=True)
+            time.sleep(0.4)
+        _save_cache(symbol, cached)
+
+    cached = cached.sort_values("time").drop_duplicates("time", keep="last")
+    return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy()
 
 
 def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80):
@@ -70,14 +84,38 @@ def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80):
     stock = pd.concat(stock_frames, ignore_index=True)
 
     vn_cached = _read_cache("VNINDEX")
-    if vn_cached is not None and vn_cached["time"].min() <= fetch_start and vn_cached["time"].max() >= end:
-        vn = vn_cached[(vn_cached["time"] >= fetch_start) & (vn_cached["time"] <= end)].copy()
-    else:
+    if vn_cached is None:
         index = Vnstock().index(symbol="VNINDEX", source="VCI")
-        raw = index.quote.history(start=fetch_start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"))
+        raw = index.quote.history(
+            start=fetch_start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+        )
         vn = raw.rename(columns={"date": "time", "Date": "time"}).copy()
         vn = vn[["time", "open", "high", "low", "close", "volume"]].assign(symbol="VNINDEX")
         _save_cache("VNINDEX", vn)
+        time.sleep(0.4)
+    else:
+        vn_cached["time"] = pd.to_datetime(vn_cached["time"])
+        if fetch_start < vn_cached["time"].min():
+            left = Vnstock().index(symbol="VNINDEX", source="VCI").quote.history(
+                start=fetch_start.strftime("%Y-%m-%d"),
+                end=vn_cached["time"].min().strftime("%Y-%m-%d"),
+            )
+            left = left.rename(columns={"date": "time", "Date": "time"})
+            left = left[["time", "open", "high", "low", "close", "volume"]].assign(symbol="VNINDEX")
+            vn_cached = pd.concat([vn_cached, left], ignore_index=True)
+            time.sleep(0.4)
+        if end > vn_cached["time"].max():
+            right = Vnstock().index(symbol="VNINDEX", source="VCI").quote.history(
+                start=vn_cached["time"].max().strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+            )
+            right = right.rename(columns={"date": "time", "Date": "time"})
+            right = right[["time", "open", "high", "low", "close", "volume"]].assign(symbol="VNINDEX")
+            vn_cached = pd.concat([vn_cached, right], ignore_index=True)
+            time.sleep(0.4)
+        _save_cache("VNINDEX", vn_cached)
+        vn = vn_cached
 
     for df in (stock, vn):
         df["time"] = pd.to_datetime(df["time"])
@@ -86,4 +124,5 @@ def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80):
         df.dropna(subset=["time", "close"], inplace=True)
         df.sort_values(["symbol", "time"], inplace=True)
 
+    vn = vn[(vn["time"] >= fetch_start) & (vn["time"] <= end)].copy()
     return stock, vn
