@@ -22,7 +22,6 @@ from membership import symbols_for_period
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 REQUEST_INTERVAL_SECONDS = 1.25
-MAX_ATTEMPTS = 3
 _last_request_at = 0.0
 _market = None
 
@@ -78,38 +77,46 @@ def _configure_vnstock(api_key: str | None = None) -> None:
             pass
 
 
-def _rate_limit_gate(interval: float = REQUEST_INTERVAL_SECONDS) -> None:
+def _rate_limit_gate() -> None:
     global _last_request_at
-    wait = interval - (time.monotonic() - _last_request_at)
+    wait = REQUEST_INTERVAL_SECONDS - (time.monotonic() - _last_request_at)
     if wait > 0:
         time.sleep(wait)
     _last_request_at = time.monotonic()
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    text = f"{type(exc).__name__} {exc}".lower()
-    keys = ["429", "rate limit", "rate_limit", "quota", "too many", "limit exceeded", "requests per minute", "requests/min"]
-    return any(k in text for k in keys)
+def _safe_error(exc: Exception) -> str:
+    key = os.getenv("VNSTOCK_API_KEY", "")
+    return str(exc).replace(key, "[API_KEY]")[:700]
 
 
 def _call(fetch_fn, symbol: str) -> pd.DataFrame:
-    last_exc = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            _rate_limit_gate()
-            return fetch_fn()
-        except Exception as exc:
-            last_exc = exc
-            if attempt >= MAX_ATTEMPTS:
-                break
-            if _is_rate_limit_error(exc):
-                time.sleep(65)
-            else:
-                time.sleep(3 * attempt)
-    error_type = type(last_exc).__name__ if last_exc else "UnknownError"
-    key = os.getenv("VNSTOCK_API_KEY", "")
-    error_text = str(last_exc).replace(key, "[API_KEY]")[:700] if last_exc else "Không rõ nguyên nhân"
-    raise RuntimeError(f"VNstock lỗi khi tải {symbol}. Loại lỗi: {error_type}. Chi tiết: {error_text}") from last_exc
+    # Do not add another retry layer around Vnstock. The library itself may
+    # retry internally; wrapping it again can make a single symbol appear
+    # frozen for several minutes. We deliberately fail fast here so the app
+    # can report the exact symbol and continue with the remaining cache/data.
+    _rate_limit_gate()
+    started = time.monotonic()
+    try:
+        result = fetch_fn()
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        raise RuntimeError(
+            f"VNstock lỗi khi tải {symbol} sau {elapsed:.1f} giây. "
+            f"Loại lỗi: {type(exc).__name__}. Chi tiết: {_safe_error(exc)}"
+        ) from exc
+    if result is None or getattr(result, "empty", False):
+        elapsed = time.monotonic() - started
+        raise RuntimeError(f"VNstock trả dữ liệu rỗng cho {symbol} sau {elapsed:.1f} giây.")
+    return result
+
+
+def _required_count(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    # ohlcv supports count when start/end are omitted. This avoids some
+    # provider-side date-range handling issues and fetches one contiguous
+    # block per symbol. Add a safety margin for weekends and holidays.
+    calendar_days = max(1, (pd.Timestamp(end) - pd.Timestamp(start)).days)
+    return max(250, int(calendar_days * 1.7) + 30)
 
 
 def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -130,14 +137,24 @@ def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 def _fetch_equity(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     market = _get_market()
-    raw = _call(lambda: market.equity(symbol).ohlcv(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval="1D"), symbol)
-    return _normalize_ohlcv(raw, symbol)
+    count = _required_count(start, end)
+    raw = _call(
+        lambda: market.equity(symbol).ohlcv(interval="1D", count=count),
+        symbol,
+    )
+    df = _normalize_ohlcv(raw, symbol)
+    return df[(df["time"] >= start) & (df["time"] <= end)].copy()
 
 
 def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     market = _get_market()
-    raw = _call(lambda: market.index("VNINDEX").ohlcv(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval="1D"), "VNINDEX")
-    return _normalize_ohlcv(raw, "VNINDEX")
+    count = _required_count(start, end)
+    raw = _call(
+        lambda: market.index("VNINDEX").ohlcv(interval="1D", count=count),
+        "VNINDEX",
+    )
+    df = _normalize_ohlcv(raw, "VNINDEX")
+    return df[(df["time"] >= start) & (df["time"] <= end)].copy()
 
 
 def _load_symbol(symbol: str, fetch_start: pd.Timestamp, end: pd.Timestamp, force_refresh: bool = False) -> tuple[pd.DataFrame, bool]:
@@ -158,7 +175,10 @@ def _load_symbol(symbol: str, fetch_start: pd.Timestamp, end: pd.Timestamp, forc
             fetched = True
     _save_cache(symbol, cached)
     cached = cached.sort_values("time").drop_duplicates("time", keep="last")
-    return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy(), fetched
+    result = cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy()
+    if result.empty:
+        raise RuntimeError(f"Không có dữ liệu hợp lệ cho {symbol} trong khoảng đã chọn.")
+    return result, fetched
 
 
 def _load_index(fetch_start: pd.Timestamp, end: pd.Timestamp, force_refresh: bool = False) -> tuple[pd.DataFrame, bool]:
@@ -179,7 +199,10 @@ def _load_index(fetch_start: pd.Timestamp, end: pd.Timestamp, force_refresh: boo
             fetched = True
     _save_cache("VNINDEX", cached)
     cached = cached.sort_values("time").drop_duplicates("time", keep="last")
-    return cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy(), fetched
+    result = cached[(cached["time"] >= fetch_start) & (cached["time"] <= end)].copy()
+    if result.empty:
+        raise RuntimeError("Không có dữ liệu VNINDEX trong khoảng đã chọn.")
+    return result, fetched
 
 
 def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80, api_key: str | None = None, progress_callback: Callable[[int, int, str, str], None] | None = None, force_refresh: bool = False):
@@ -189,10 +212,12 @@ def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80, a
     total = len(symbols) + 1
     stock_frames = []
     failed = []
+
     for i, symbol in enumerate(symbols, 1):
-        status = cache_status(symbol, fetch_start, end) if not force_refresh else "Làm mới bắt buộc"
+        status = cache_status(symbol, fetch_start, end) if not force_refresh else "Bỏ qua cache, đang gọi VNstock"
         if progress_callback:
             progress_callback(i - 1, total, symbol, status)
+            progress_callback(i - 1, total, symbol, "Đang gọi VNstock cho mã này...")
         try:
             frame, fetched = _load_symbol(symbol, fetch_start, end, force_refresh=force_refresh)
             stock_frames.append(frame)
@@ -201,13 +226,16 @@ def load_market_data(start: pd.Timestamp, end: pd.Timestamp, warmup: int = 80, a
         except Exception as exc:
             failed.append((symbol, str(exc)))
             if progress_callback:
-                progress_callback(i, total, symbol, f"LỖI: {str(exc)[:250]}")
+                progress_callback(i, total, symbol, f"LỖI: {str(exc)[:350]}")
+
     if failed:
         details = "; ".join(f"{s}: {e}" for s, e in failed)
         raise RuntimeError(f"Không tải được {len(failed)} mã: {details}")
+
     vn, fetched = _load_index(fetch_start, end, force_refresh=force_refresh)
     if progress_callback:
         progress_callback(total, total, "VNINDEX", "Đã tải API" if fetched else "Dùng cache")
+
     stock = pd.concat(stock_frames, ignore_index=True)
     for df in (stock, vn):
         df["time"] = pd.to_datetime(df["time"])
