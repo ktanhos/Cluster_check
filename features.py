@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from config import FEATURES, VN30
+from config import FEATURES
 
 
 Z_FEATURES = [f"Z_{f}" for f in FEATURES]
@@ -24,12 +24,12 @@ def build_feature_panel(stock: pd.DataFrame, vn: pd.DataFrame) -> pd.DataFrame:
     s["Ret1D"] = s.groupby("symbol")["close"].pct_change()
     i["Ret1D"] = i["close"].pct_change()
 
-    frames = []
     vn_small = i[["time", "close", "Ret1D"]].rename(
         columns={"close": "vn_close", "Ret1D": "vn_ret"}
     )
 
-    for ticker in VN30:
+    frames = []
+    for ticker in sorted(s["symbol"].dropna().unique()):
         x = s[s["symbol"] == ticker].copy().sort_values("time")
         x = x.merge(vn_small, on="time", how="inner")
         x["Return20"] = x["close"].pct_change(20)
@@ -46,12 +46,11 @@ def build_feature_panel(stock: pd.DataFrame, vn: pd.DataFrame) -> pd.DataFrame:
         x["Ticker"] = ticker
         frames.append(x[["time", "Ticker"] + FEATURES])
 
+    if not frames:
+        raise ValueError("Không có dữ liệu cổ phiếu để tính feature.")
+
     panel = pd.concat(frames, ignore_index=True)
     panel = panel.sort_values(["time", "Ticker"]).reset_index(drop=True)
-
-    # Normalize cross-sectionally by date. The resulting feature space has
-    # the same interpretation across rolling windows, unlike a StandardScaler
-    # that is re-fitted on every historical window.
     panel = _cross_sectional_zscore(panel, FEATURES)
     return panel
 
