@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from backtest import calculate_forward_returns, summarize_forward_returns
-from charts import behavior_map, cluster_count_chart, migration_heatmap
+from charts import behavior_map, cluster_count_chart, membership_count_chart, migration_heatmap
 from clustering import rolling_cluster
 from config import (
     DEFAULT_CONFIDENCE_THRESHOLD,
@@ -83,9 +83,10 @@ if run:
         st.info("Kiểm tra API Key, giới hạn truy cập và dữ liệu cache rồi thử lại.")
         st.stop()
 
-    st.success(f"Hoàn tất. Có {rolling_result['Date'].nunique()} mốc nghiên cứu và 30 mã thành phần tại mỗi mốc.")
+    n_dates = int(rolling_result["Date"].nunique())
+    st.success(f"Hoàn tất. Có {n_dates} mốc nghiên cứu; mỗi mốc chỉ sử dụng các mã đang thuộc VN30 tại đúng ngày đó.")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Mốc nghiên cứu", int(rolling_result["Date"].nunique()))
+    col1.metric("Mốc nghiên cứu", n_dates)
     col2.metric("Migration thô", int(migration["Migration"].sum()))
     col3.metric("Migration xác nhận", int(migration["MigrationConfirmed"].sum()))
     col4.metric("Confidence TB", f"{migration['AssignmentConfidence'].mean():.2f}")
@@ -95,20 +96,26 @@ if run:
     with tab1:
         latest_date = rolling_result["Date"].max()
         latest = rolling_result[rolling_result["Date"] == latest_date].copy()
-        st.plotly_chart(behavior_map(latest, f"Biểu đồ hành vi VN30 tại {latest_date:%d/%m/%Y}"), use_container_width=True)
+        st.plotly_chart(
+            behavior_map(latest, f"Biểu đồ hành vi VN30 tại {latest_date:%d/%m/%Y}"),
+            use_container_width=True,
+        )
+        st.caption("Behavior Map chỉ vẽ các mã đang là thành phần VN30 tại ngày quan sát cuối. Tâm cụm trên hình là tâm thực nghiệm của các cổ phiếu được gán vào từng nhóm trong không gian hai chiều.")
         st.plotly_chart(cluster_count_chart(rolling_result), use_container_width=True)
         st.dataframe(latest.sort_values(["Cluster", "Ticker"]), use_container_width=True)
 
     with tab2:
-        changes = change_table()
-        change_dates = [d for d in changes["EffectiveDate"].tolist() if pd.Timestamp(start) <= d <= pd.Timestamp(end)]
-        st.plotly_chart(migration_heatmap(migration, change_dates), use_container_width=True)
+        st.plotly_chart(migration_heatmap(migration, change_table()), use_container_width=True)
+        st.caption("Ô trống có chủ đích: mã chưa thuộc VN30 tại thời điểm đó hoặc chưa có kết quả phân loại. Đường đỏ là ngày hiệu lực thay đổi thành phần; chú thích phía trên cho biết mã vào và mã ra.")
         st.dataframe(migration.sort_values(["Date", "Ticker"]), use_container_width=True)
-        st.caption("Vùng trống trên heatmap là thời gian mã chưa thuộc rổ VN30. Đường đỏ đánh dấu ngày thay đổi thành phần.")
 
     with tab3:
         st.subheader("Lịch sử thay đổi thành phần")
         st.dataframe(change_table(), use_container_width=True)
+        st.plotly_chart(
+            membership_count_chart(sorted(pd.to_datetime(rolling_result["Date"].unique()))),
+            use_container_width=True,
+        )
         st.info("Rolling clustering chỉ sử dụng các mã đang thuộc rổ VN30 tại từng ngày. Mã bị loại dừng tham gia từ ngày hiệu lực; mã mới bắt đầu tham gia từ ngày hiệu lực.")
 
     with tab4:
