@@ -4,4 +4,4 @@ numpy>=2.0,<3
 scikit-learn>=1.6,<2
 scipy>=1.13,<2
 plotly>=6.0,<7
-vnstock>=4.0.2,<5
+vnstock>=4.0.3,<4.1
