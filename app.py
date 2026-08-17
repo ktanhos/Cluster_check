@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "USER-FRIENDLY-2026-08-17-02"
+APP_VERSION = "USER-FRIENDLY-2026-08-17-03"
 
 from backtest import build_reference_forecast, calculate_forward_returns, summarize_forward_returns
 from charts import behavior_history_chart, behavior_map, behavior_trajectory_chart, cluster_count_chart, migration_heatmap
@@ -107,14 +107,14 @@ if "model_result" in st.session_state:
     st.plotly_chart(behavior_map(rolling_result), use_container_width=True)
 
     st.subheader("Theo dõi cổ phiếu")
-    st.caption("Bạn có thể xem một mã, nhiều mã hoặc theo dõi toàn bộ quá trình chuyển nhóm. Với một mã, biểu đồ thứ hai cho thấy đường đi của mã đó trên chính bản đồ hành vi.")
+    st.caption("Chọn một mã để xem toàn bộ hành trình; chọn nhiều mã để so sánh thời điểm chuyển nhóm.")
     available_tickers = sorted(set(VN30).intersection(set(rolling_result["Ticker"].unique())))
     selected_tickers = st.multiselect("Chọn cổ phiếu muốn theo dõi", options=available_tickers, default=available_tickers[:1], max_selections=10)
     if selected_tickers:
         st.plotly_chart(behavior_history_chart(rolling_result, selected_tickers, start=pd.Timestamp(start), end=pd.Timestamp(end)), use_container_width=True)
         if len(selected_tickers) == 1:
             st.plotly_chart(behavior_trajectory_chart(rolling_result, selected_tickers[0]), use_container_width=True)
-            st.info("Đọc biểu đồ: đường đi sang phải nghĩa là sức mạnh tương đối tăng; đi lên nghĩa là mức biến động tăng. Mỗi điểm là một lần quan sát. Màu nhóm trong bản đồ hiện tại giúp đọc trạng thái, còn biểu đồ này tập trung vào quá trình di chuyển.")
+            st.info("Đọc biểu đồ: đi sang phải nghĩa là sức mạnh tương đối tăng; đi lên nghĩa là mức biến động tăng. Mỗi điểm là một lần quan sát. Đường nối cho thấy cổ phiếu đã di chuyển từ trạng thái này sang trạng thái khác như thế nào.")
 
     st.subheader("Các nhóm thay đổi như thế nào?")
     st.caption("Số cổ phiếu trong từng nhóm ở mỗi lần quan sát. Dùng để xem thị trường đang tập trung nhiều hơn vào nhóm nào.")
@@ -124,13 +124,16 @@ if "model_result" in st.session_state:
     st.caption("Mỗi hàng là một cổ phiếu. Các ô màu cho biết cổ phiếu đang thuộc nhóm nào. Vạch đỏ đánh dấu thời điểm thành phần VN30 thay đổi.")
     st.plotly_chart(migration_heatmap(migration), use_container_width=True)
 
-    st.subheader("1. Kiểm tra xem chuyển nhóm có liên quan đến lợi suất không?")
-    st.caption("Bảng này là kiểm tra lịch sử: sau một lần chuyển từ nhóm này sang nhóm khác, lợi suất trung bình 5, 10 và 20 phiên sau đó là bao nhiêu. Số quan sát càng ít thì kết luận càng yếu.")
+    st.subheader("Kiểm tra 1: chuyển nhóm có liên quan đến lợi suất không?")
+    st.caption("Bảng này nhìn lại các lần chuyển nhóm trong quá khứ. Ví dụ nếu một cổ phiếu chuyển từ Nhóm A sang Nhóm B, lợi suất trung bình 5, 10 và 20 phiên sau đó là bao nhiêu? Số quan sát càng ít thì kết luận càng yếu.")
     if forward_summary.empty:
         st.info("Chưa có đủ lần chuyển nhóm để thực hiện kiểm tra này.")
     else:
         display_forward = forward_summary.copy()
-        rename_forward = {
+        for c in ["ForwardReturn5D_Mean", "ForwardReturn5D_Median", "ForwardReturn10D_Mean", "ForwardReturn20D_Mean", "ForwardReturn5D_PositiveRate"]:
+            if c in display_forward:
+                display_forward[c] = display_forward[c] * 100
+        display_forward = display_forward.rename(columns={
             "Transition": "Chuyển từ nhóm nào sang nhóm nào",
             "Events": "Số lần xuất hiện",
             "ForwardReturn5D_EventsInBasket": "Số quan sát 5 phiên",
@@ -139,44 +142,45 @@ if "model_result" in st.session_state:
             "ForwardReturn5D_PositiveRate": "Tỷ lệ tăng sau 5 phiên",
             "ForwardReturn10D_Mean": "Lợi suất TB sau 10 phiên",
             "ForwardReturn20D_Mean": "Lợi suất TB sau 20 phiên",
-        }
-        display_forward = display_forward.rename(columns={k: v for k, v in rename_forward.items() if k in display_forward.columns})
+        })
         keep = [c for c in ["Chuyển từ nhóm nào sang nhóm nào", "Số lần xuất hiện", "Số quan sát 5 phiên", "Lợi suất TB sau 5 phiên", "Trung vị sau 5 phiên", "Tỷ lệ tăng sau 5 phiên", "Lợi suất TB sau 10 phiên", "Lợi suất TB sau 20 phiên"] if c in display_forward.columns]
         st.dataframe(display_forward[keep], use_container_width=True)
 
-    st.subheader("2. Xếp hạng tham khảo theo dữ liệu lịch sử")
-    st.caption("Đây chưa phải mô hình dự báo. Ứng dụng lấy các lần quan sát trong quá khứ có cùng nhóm hành vi với trạng thái hiện tại rồi tính lợi suất tương lai trung bình. Mục đích là tạo một cách xếp hạng để nghiên cứu xem tín hiệu có giá trị hay không.")
+    st.subheader("Kiểm tra 2: trạng thái hiện tại gợi ý điều gì nếu nhìn lại lịch sử?")
+    st.caption("Ứng dụng lấy các quan sát trong quá khứ có cùng nhóm hành vi với trạng thái hiện tại. Nếu cổ phiếu vừa chuyển nhóm và có đủ dữ liệu về đúng kiểu chuyển đó, ứng dụng ưu tiên dùng lịch sử của chính kiểu chuyển nhóm. Đây là ước tính tham khảo, chưa phải mô hình dự báo đã được kiểm định.")
     if reference_forecast.empty:
         st.info("Chưa đủ dữ liệu lịch sử để tạo xếp hạng tham khảo.")
     else:
         display_forecast = reference_forecast.copy()
-        display_forecast["ReferenceScore"] = display_forecast["ReferenceScore"] * 100
-        for c in ["HistoricalMean5D", "HistoricalMean10D", "HistoricalMean20D", "PositiveRate5D", "PositiveRate10D", "PositiveRate20D"]:
-            if c in display_forecast:
-                display_forecast[c] = display_forecast[c] * 100
+        percentage_cols = [c for c in ["ReferenceScore", "HistoricalMean5D", "HistoricalMean10D", "HistoricalMean20D", "TransitionMean5D", "TransitionMean10D", "TransitionMean20D", "PositiveRate5D", "PositiveRate10D", "PositiveRate20D"] if c in display_forecast.columns]
+        for c in percentage_cols:
+            display_forecast[c] = display_forecast[c] * 100
         display_forecast = display_forecast.rename(columns={
-            "Rank": "Xếp hạng",
+            "Rank": "Xếp hạng tham khảo",
             "Ticker": "Mã cổ phiếu",
             "CurrentGroup": "Nhóm hiện tại",
             "CurrentStatus": "Trạng thái hiện tại",
+            "CurrentTransition": "Chuyển nhóm hiện tại",
             "Confidence": "Độ chắc chắn",
-            "HistoricalObservations": "Số lần quan sát lịch sử",
-            "SameStatusObservations": "Số lần cùng trạng thái",
-            "HistoricalMean5D": "TB sau 5 phiên",
-            "HistoricalMean10D": "TB sau 10 phiên",
-            "HistoricalMean20D": "TB sau 20 phiên",
+            "HistoricalObservations": "Số quan sát cùng nhóm",
+            "TransitionObservations": "Số quan sát cùng kiểu chuyển",
+            "HistoricalMean5D": "TB sau 5 phiên cùng nhóm",
+            "HistoricalMean10D": "TB sau 10 phiên cùng nhóm",
+            "HistoricalMean20D": "TB sau 20 phiên cùng nhóm",
+            "TransitionMean5D": "TB sau 5 phiên cùng kiểu chuyển",
+            "TransitionMean10D": "TB sau 10 phiên cùng kiểu chuyển",
+            "TransitionMean20D": "TB sau 20 phiên cùng kiểu chuyển",
             "PositiveRate5D": "Tỷ lệ tăng 5 phiên",
-            "PositiveRate10D": "Tỷ lệ tăng 10 phiên",
-            "PositiveRate20D": "Tỷ lệ tăng 20 phiên",
             "ReferenceScore": "Điểm tham khảo",
+            "ForecastBasis": "Căn cứ xếp hạng",
             "EnoughHistory": "Đủ dữ liệu lịch sử",
         })
-        keep = [c for c in ["Xếp hạng", "Mã cổ phiếu", "Nhóm hiện tại", "Trạng thái hiện tại", "Độ chắc chắn", "Số lần quan sát lịch sử", "TB sau 5 phiên", "TB sau 10 phiên", "TB sau 20 phiên", "Tỷ lệ tăng 5 phiên", "Điểm tham khảo", "Đủ dữ liệu lịch sử"] if c in display_forecast.columns]
+        keep = [c for c in ["Xếp hạng tham khảo", "Mã cổ phiếu", "Nhóm hiện tại", "Trạng thái hiện tại", "Chuyển nhóm hiện tại", "Độ chắc chắn", "Số quan sát cùng nhóm", "Số quan sát cùng kiểu chuyển", "TB sau 5 phiên cùng nhóm", "TB sau 10 phiên cùng nhóm", "TB sau 20 phiên cùng nhóm", "TB sau 5 phiên cùng kiểu chuyển", "Điểm tham khảo", "Căn cứ xếp hạng", "Đủ dữ liệu lịch sử"] if c in display_forecast.columns]
         st.dataframe(display_forecast[keep], use_container_width=True)
-        st.warning("Không nên đọc Xếp hạng tham khảo như khuyến nghị mua bán. Đây là kết quả mô tả dựa trên mẫu lịch sử hiện có và cần kiểm định ngoài mẫu trước khi dùng như tín hiệu đầu tư.")
+        st.warning("Xếp hạng này không phải khuyến nghị mua bán. Nó chỉ nói rằng trong mẫu lịch sử hiện có, những cổ phiếu đang ở trạng thái tương tự từng có lợi suất tương lai như thế nào. Muốn biến nó thành tín hiệu đầu tư cần kiểm định ngoài mẫu, kiểm định ý nghĩa thống kê và chi phí giao dịch.")
 
-    st.subheader("Những lần chuyển nhóm")
-    st.caption("Bảng này trả lời câu hỏi cổ phiếu nào đã chuyển nhóm, chuyển vào ngày nào và thay đổi đó có vẻ bền hay chỉ là thay đổi ngắn hạn.")
+    st.subheader("Chi tiết các lần chuyển nhóm")
+    st.caption("Bảng này trả lời cổ phiếu nào chuyển nhóm, chuyển vào ngày nào và thay đổi đó có được duy trì hay không.")
     display_migration = migration.copy()
     rename_map = {"Ticker": "Mã cổ phiếu", "Date": "Ngày", "ClusterLabel": "Nhóm mới", "PreviousObservedCluster": "Nhóm trước", "Transition": "Thay đổi", "MigrationType": "Loại thay đổi", "AssignmentConfidence": "Độ chắc chắn", "MigrationSignal": "Có tín hiệu chuyển nhóm", "MigrationConfirmed": "Được xác nhận"}
     display_migration = display_migration.rename(columns={k: v for k, v in rename_map.items() if k in display_migration.columns})
