@@ -1,10 +1,8 @@
 import os
-
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "USER-FRIENDLY-2026-08-17-04"
-
+APP_VERSION = "USER-FRIENDLY-2026-08-17-05"
 from backtest import build_reference_forecast, calculate_forward_returns, evaluate_reference_forecast, summarize_forward_returns
 from charts import behavior_history_chart, behavior_map, behavior_trajectory_chart, cluster_count_chart, migration_heatmap
 from clustering import rolling_cluster
@@ -27,19 +25,17 @@ with st.sidebar:
     end = st.date_input("Đến ngày", DEFAULT_END)
     update_data = st.button("Tải dữ liệu mới", type="primary", use_container_width=True)
     st.caption("Chỉ khi bấm nút này ứng dụng mới gọi VNstock. Sau khi tải xong, thay đổi thiết lập bên dưới không gọi lại dữ liệu.")
-
     st.divider()
     st.header("2. Cách nhận diện nhóm")
-    train_window = st.number_input("Số phiên dùng để nhận diện hành vi", min_value=60, max_value=504, value=DEFAULT_TRAIN_WINDOW, step=5, help="Số phiên giao dịch gần nhất dùng để nhận diện trạng thái.")
-    k = st.number_input("Số nhóm hành vi", min_value=2, max_value=8, value=DEFAULT_K, step=1, help="Số nhóm cổ phiếu được hình thành. Mặc định là 4.")
-    step = st.number_input("Cứ bao nhiêu phiên cập nhật một lần", min_value=1, max_value=20, value=DEFAULT_STEP, step=1, help="Ví dụ 5 nghĩa là cứ 5 phiên tạo một lần quan sát mới.")
+    train_window = st.number_input("Số phiên dùng để nhận diện hành vi", min_value=60, max_value=504, value=DEFAULT_TRAIN_WINDOW, step=5)
+    k = st.number_input("Số nhóm hành vi", min_value=2, max_value=8, value=DEFAULT_K, step=1)
+    step = st.number_input("Cứ bao nhiêu phiên cập nhật một lần", min_value=1, max_value=20, value=DEFAULT_STEP, step=1)
     with st.expander("Thiết lập nâng cao", expanded=False):
         confirmation_steps = st.number_input("Một lần chuyển nhóm cần được giữ trong bao nhiêu lần quan sát", min_value=1, max_value=5, value=DEFAULT_CONFIRMATION_STEPS, step=1)
         confidence_threshold = st.slider("Độ chắc chắn tối thiểu khi gán nhóm", min_value=0.0, max_value=0.9, value=DEFAULT_CONFIDENCE_THRESHOLD, step=0.05)
     run_model = st.button("Phân tích hành vi", use_container_width=True)
 
 api_key = st.session_state.get("vnstock_api_key", "").strip() or os.getenv("VNSTOCK_API_KEY", "").strip()
-
 if pd.Timestamp(start) >= pd.Timestamp(end):
     st.error("Ngày bắt đầu phải nhỏ hơn ngày kết thúc.")
     st.stop()
@@ -55,7 +51,6 @@ if update_data:
     detail_box = st.empty()
     error_box = st.empty()
     error_messages = []
-
     def on_progress(done: int, total_count: int, symbol: str, status: str):
         progress.progress(min(done / total_count, 1.0))
         status_box.info(f"Đang tải {done}/{total_count}: {symbol}")
@@ -63,7 +58,6 @@ if update_data:
         if status.startswith("LỖI:"):
             error_messages.append(f"{symbol}: {status[5:].strip()}")
             error_box.warning("Mã chưa tải được: " + " | ".join(error_messages[-5:]))
-
     try:
         with st.spinner("Đang tải bộ dữ liệu mới. Không sử dụng dữ liệu cũ."):
             stock, index = load_market_data(pd.Timestamp(start), pd.Timestamp(end), api_key=api_key, progress_callback=on_progress)
@@ -80,7 +74,6 @@ if update_data:
 if "market_data" not in st.session_state:
     st.info("Bắt đầu bằng cách nhập mã truy cập, chọn khoảng thời gian và bấm Tải dữ liệu mới.")
     st.stop()
-
 stock, index = st.session_state["market_data"]
 st.success("Dữ liệu đã sẵn sàng. Bạn có thể thay đổi cách phân nhóm và bấm Phân tích hành vi mà không gọi lại VNstock.")
 
@@ -139,8 +132,7 @@ if "model_result" in st.session_state:
         for c in ["ForwardReturn5D_Mean", "ForwardReturn5D_Median", "ForwardReturn10D_Mean", "ForwardReturn20D_Mean", "ForwardReturn5D_PositiveRate"]:
             if c in display_forward:
                 display_forward[c] = display_forward[c] * 100
-        display_forward = display_forward.rename(columns={
-            "Transition": "Chuyển từ nhóm nào sang nhóm nào", "Events": "Số lần xuất hiện", "ForwardReturn5D_EventsInBasket": "Số quan sát 5 phiên", "ForwardReturn5D_Mean": "Lợi suất TB sau 5 phiên", "ForwardReturn5D_Median": "Trung vị sau 5 phiên", "ForwardReturn5D_PositiveRate": "Tỷ lệ tăng sau 5 phiên", "ForwardReturn10D_Mean": "Lợi suất TB sau 10 phiên", "ForwardReturn20D_Mean": "Lợi suất TB sau 20 phiên"})
+        display_forward = display_forward.rename(columns={"Transition": "Chuyển từ nhóm nào sang nhóm nào", "Events": "Số lần xuất hiện", "ForwardReturn5D_EventsInBasket": "Số quan sát 5 phiên", "ForwardReturn5D_Mean": "Lợi suất TB sau 5 phiên", "ForwardReturn5D_Median": "Trung vị sau 5 phiên", "ForwardReturn5D_PositiveRate": "Tỷ lệ tăng sau 5 phiên", "ForwardReturn10D_Mean": "Lợi suất TB sau 10 phiên", "ForwardReturn20D_Mean": "Lợi suất TB sau 20 phiên"})
         keep = [c for c in ["Chuyển từ nhóm nào sang nhóm nào", "Số lần xuất hiện", "Số quan sát 5 phiên", "Lợi suất TB sau 5 phiên", "Trung vị sau 5 phiên", "Tỷ lệ tăng sau 5 phiên", "Lợi suất TB sau 10 phiên", "Lợi suất TB sau 20 phiên"] if c in display_forward.columns]
         st.dataframe(display_forward[keep], use_container_width=True)
 
@@ -159,7 +151,7 @@ if "model_result" in st.session_state:
         st.warning("Xếp hạng này chưa phải mô hình dự báo được kiểm định ngoài mẫu.")
 
     st.subheader("Kiểm tra 3: xếp hạng có dự báo được lợi suất ngoài mẫu không?")
-    st.caption("Đây là bước quan trọng hơn bảng tham khảo. Tại mỗi ngày trong quá khứ, hệ thống chỉ dùng thông tin đã có trước ngày đó để tạo xếp hạng. Sau đó mới so sánh với lợi suất thực tế 5, 10 và 20 phiên tiếp theo. Vì vậy không dùng dữ liệu tương lai để tạo dự báo.")
+    st.caption("Tại mỗi ngày trong quá khứ, hệ thống chỉ dùng thông tin đã có trước ngày đó để tạo xếp hạng. Sau đó mới so sánh với lợi suất thực tế 5, 10 và 20 phiên tiếp theo.")
     if forecast_validation.empty:
         st.info("Chưa đủ số lần quan sát để thực hiện kiểm định ngoài mẫu. Hãy dùng khoảng thời gian dài hơn hoặc giảm bước quan sát.")
     else:
@@ -169,12 +161,12 @@ if "model_result" in st.session_state:
                 display_validation[c] = display_validation[c] * 100
         display_validation = display_validation.rename(columns={"Horizon": "Kỳ dự báo", "Method": "Cách dự báo", "ForecastDates": "Số ngày kiểm định", "AverageObservations": "Số cổ phiếu TB", "MeanSpearmanIC": "Tương quan xếp hạng TB", "PositiveICRate": "Tỷ lệ ngày tương quan dương", "DirectionalAccuracy": "Tỷ lệ dự báo đúng hướng", "MeanTopBottomSpread": "Chênh lệch nhóm cao và thấp", "MAE": "Sai số tuyệt đối TB"})
         st.dataframe(display_validation, use_container_width=True)
-
         comparison = forecast_validation.pivot(index="Horizon", columns="Method", values="MeanSpearmanIC")
         if "StateOnly" in comparison.columns and "MigrationAware" in comparison.columns:
             comparison["MigrationGain"] = comparison["MigrationAware"] - comparison["StateOnly"]
             display_gain = comparison.reset_index().rename(columns={"Horizon": "Kỳ dự báo", "StateOnly": "Chỉ dùng nhóm hiện tại", "MigrationAware": "Có thêm Migration", "MigrationGain": "Phần cải thiện của Migration"})
-            display_gain[[c for c in ["Kỳ dự báo", "Chỉ dùng nhóm hiện tại", "Có thêm Migration", "Phần cải thiện của Migration"] if c in display_gain.columns]] *= 100
+            numeric_gain = [c for c in ["Chỉ dùng nhóm hiện tại", "Có thêm Migration", "Phần cải thiện của Migration"] if c in display_gain.columns]
+            display_gain[numeric_gain] = display_gain[numeric_gain] * 100
             st.markdown("**Migration có thêm thông tin hay không?**")
             st.dataframe(display_gain, use_container_width=True)
             st.caption("Nếu phần cải thiện của Migration dương và ổn định qua nhiều giai đoạn, đó mới là bằng chứng rằng việc chuyển nhóm có thể bổ sung thông tin ngoài trạng thái nhóm hiện tại. Một vài kỳ dương riêng lẻ chưa đủ để kết luận.")
