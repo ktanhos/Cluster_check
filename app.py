@@ -3,6 +3,18 @@ import os
 import pandas as pd
 import streamlit as st
 
+# Configure Vnstock network behaviour before importing the data loader. The
+# free library has its own retry layer; one short retry is enough because the
+# application can resume from per-symbol cache on a later run.
+try:
+    from vnstock.config import Config
+    Config.REQUEST_TIMEOUT = 15
+    Config.RETRIES = 1
+    Config.BACKOFF_MIN = 1
+    Config.BACKOFF_MAX = 3
+except Exception:
+    pass
+
 from backtest import calculate_forward_returns, summarize_forward_returns
 from charts import behavior_map, cluster_count_chart, membership_count_chart, migration_heatmap
 from clustering import rolling_cluster
@@ -69,7 +81,7 @@ if update_data:
                 error_messages.append(f"{symbol}: {status[5:].strip()}")
                 error_box.warning("Mã lỗi trong quá trình tải: " + " | ".join(error_messages[-5:]))
 
-        with st.spinner("Đang cập nhật dữ liệu. Hệ thống tự giãn cách yêu cầu và thử lại khi gặp lỗi giới hạn..."):
+        with st.spinner("Đang cập nhật dữ liệu. Hệ thống tự giãn cách yêu cầu và thử lại khi gặp lỗi..."):
             stock, index = load_market_data(pd.Timestamp(start), pd.Timestamp(end), api_key=api_key, progress_callback=on_progress, force_refresh=force_refresh)
         st.session_state["market_data"] = (stock, index)
         progress.progress(1.0)
@@ -86,7 +98,6 @@ if "market_data" not in st.session_state:
     st.stop()
 
 stock, index = st.session_state["market_data"]
-
 st.success("Dữ liệu đã sẵn sàng. Thay đổi K, cửa sổ rolling hoặc bước cập nhật không cần gọi lại VNstock.")
 
 if run_model:
@@ -103,43 +114,19 @@ if run_model:
         st.exception(exc)
         st.stop()
 
-if "model_result" not in st.session_state:
-    st.info("Bấm Chạy mô hình để bắt đầu rolling clustering.")
-    st.stop()
-
-rolling_result, diagnostics, migration, forward_summary = st.session_state["model_result"]
-n_dates = int(rolling_result["Date"].nunique())
-feature_migrations = int(migration["EconomicallyDrivenMigration"].sum())
-model_migrations = int((migration["MigrationType"] == "Model-driven").sum())
-mixed_migrations = int((migration["MigrationType"] == "Mixed").sum())
-
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Mốc nghiên cứu", n_dates)
-col2.metric("Migration", int(migration["MigrationSignal"].sum()))
-col3.metric("Feature-driven", feature_migrations)
-col4.metric("Model-driven", model_migrations)
-col5.metric("Mixed", mixed_migrations)
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Behavior Map", "Migration", "Thành phần VN30", "Forward Return", "Chẩn đoán"])
-with tab1:
-    latest_date = rolling_result["Date"].max()
-    latest = rolling_result[rolling_result["Date"] == latest_date].copy()
-    st.plotly_chart(behavior_map(latest, f"Biểu đồ hành vi VN30 tại {latest_date:%d/%m/%Y}"), use_container_width=True)
+if "model_result" in st.session_state:
+    rolling_result, diagnostics, migration, forward_summary = st.session_state["model_result"]
+    st.subheader("Behavior Map")
+    st.plotly_chart(behavior_map(rolling_result), use_container_width=True)
+    st.subheader("Cluster Timeline")
     st.plotly_chart(cluster_count_chart(rolling_result), use_container_width=True)
-    st.dataframe(latest.sort_values(["Cluster", "Ticker"]), use_container_width=True)
-with tab2:
-    st.plotly_chart(migration_heatmap(migration, change_table()), use_container_width=True)
-    st.dataframe(migration[migration["MigrationSignal"]].sort_values(["Date", "Ticker"]), use_container_width=True)
-with tab3:
-    st.subheader("Lịch sử thay đổi thành phần")
-    st.dataframe(change_table(), use_container_width=True)
-    st.plotly_chart(membership_count_chart(sorted(pd.to_datetime(rolling_result["Date"].unique()))), use_container_width=True)
-with tab4:
+    st.subheader("Migration Heatmap")
+    st.plotly_chart(migration_heatmap(migration), use_container_width=True)
+    st.subheader("Thành phần VN30")
+    st.plotly_chart(membership_count_chart(pd.Timestamp(start), pd.Timestamp(end)), use_container_width=True)
+    st.subheader("Forward Return")
     st.dataframe(forward_summary, use_container_width=True)
-with tab5:
-    st.dataframe(diagnostics, use_container_width=True)
-    diagnostic_cols = [c for c in ["Date", "Ticker", "Transition", "MigrationType", "CentroidDrift", "AssignmentConfidence", "PreviousObservedCluster", "PreviousModelCluster"] if c in migration.columns]
-    st.dataframe(migration[migration["MigrationSignal"]][diagnostic_cols].sort_values("Date"), use_container_width=True)
-
-st.download_button("Tải trạng thái cụm CSV", rolling_result.to_csv(index=False).encode("utf-8-sig"), "rolling_clusters.csv", "text/csv")
-st.download_button("Tải Migration CSV", migration.to_csv(index=False).encode("utf-8-sig"), "migration.csv", "text/csv")
+    st.subheader("Migration Detail")
+    st.dataframe(migration, use_container_width=True)
+    st.subheader("Thay đổi thành phần")
+    st.dataframe(change_table(), use_container_width=True)
