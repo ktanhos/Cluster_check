@@ -20,9 +20,16 @@ from membership import symbols_for_period
 
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
-REQUEST_INTERVAL_SECONDS = 1.35
-MAX_FETCH_RETRIES = 4
+REQUEST_INTERVAL_SECONDS = 1.05
 _last_request_at = 0.0
+_market = None
+
+
+def _get_market():
+    global _market
+    if _market is None:
+        _market = Market()
+    return _market
 
 
 def _cache_path(symbol: str) -> Path:
@@ -64,19 +71,14 @@ def _rate_limit_gate() -> None:
     _last_request_at = time.monotonic()
 
 
-def _call_with_retry(fetch_fn, symbol: str) -> pd.DataFrame:
-    last_error: Exception | None = None
-    for attempt in range(1, MAX_FETCH_RETRIES + 1):
-        _rate_limit_gate()
-        try:
-            return fetch_fn()
-        except Exception as exc:
-            last_error = exc
-            if attempt < MAX_FETCH_RETRIES:
-                time.sleep(min(20.0, 2.0 ** (attempt - 1) * 2.0))
-    error_type = type(last_error).__name__ if last_error is not None else "UnknownError"
-    error_text = str(last_error).replace(os.getenv("VNSTOCK_API_KEY", ""), "[API_KEY]")[:300] if last_error else ""
-    raise RuntimeError(f"VNstock lỗi với {symbol} sau {MAX_FETCH_RETRIES} lần thử. Loại lỗi: {error_type}. Chi tiết: {error_text}") from last_error
+def _call(fetch_fn, symbol: str) -> pd.DataFrame:
+    _rate_limit_gate()
+    try:
+        return fetch_fn()
+    except Exception as exc:
+        error_type = type(exc).__name__
+        error_text = str(exc).replace(os.getenv("VNSTOCK_API_KEY", ""), "[API_KEY]")[:500]
+        raise RuntimeError(f"VNstock lỗi khi tải {symbol}. Loại lỗi: {error_type}. Chi tiết: {error_text}") from exc
 
 
 def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -96,12 +98,14 @@ def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
 
 def _fetch_equity(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    raw = _call_with_retry(lambda: Market().equity(symbol).ohlcv(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d")), symbol)
+    market = _get_market()
+    raw = _call(lambda: market.equity(symbol).ohlcv(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval="1D"), symbol)
     return _normalize_ohlcv(raw, symbol)
 
 
 def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    raw = _call_with_retry(lambda: Market().index("VNINDEX").ohlcv(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d")), "VNINDEX")
+    market = _get_market()
+    raw = _call(lambda: market.index("VNINDEX").ohlcv(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval="1D"), "VNINDEX")
     return _normalize_ohlcv(raw, "VNINDEX")
 
 
