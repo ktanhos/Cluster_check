@@ -26,7 +26,7 @@ with st.sidebar:
     st.subheader("Khoảng dữ liệu")
     start = st.date_input("Ngày bắt đầu", DEFAULT_START)
     end = st.date_input("Ngày kết thúc", DEFAULT_END)
-    force_refresh = st.checkbox("Bắt buộc tải lại từ VNstock", value=False)
+    force_refresh = st.checkbox("Tải lại toàn bộ từ VNstock", value=False, help="Tắt để dùng cache và chỉ tải phần dữ liệu còn thiếu. Chỉ bật khi muốn bỏ qua cache.")
     update_data = st.button("Cập nhật dữ liệu VNstock", type="primary", use_container_width=True)
     st.divider()
     st.subheader("Thiết lập mô hình")
@@ -54,25 +54,31 @@ if update_data:
     progress = st.progress(0)
     status_box = st.empty()
     detail_box = st.empty()
+    error_box = st.empty()
     try:
         symbols = symbols_for_period(pd.Timestamp(start) - pd.Timedelta(days=136), pd.Timestamp(end))
         total = len(symbols) + 1
-        status_box.info(f"Chuẩn bị dữ liệu cho {len(symbols)} mã có thể thuộc VN30 trong khoảng nghiên cứu, cộng VNINDEX.")
+        status_box.info(f"Chuẩn bị dữ liệu: {len(symbols)} mã có thể thuộc VN30 trong khoảng nghiên cứu, cộng VNINDEX.")
+        error_messages = []
 
         def on_progress(done: int, total_count: int, symbol: str, status: str):
             progress.progress(min(done / total_count, 1.0))
             status_box.info(f"Đang xử lý {done}/{total_count}: {symbol}")
             detail_box.caption(status)
+            if status.startswith("LỖI:"):
+                error_messages.append(f"{symbol}: {status[5:].strip()}")
+                error_box.warning("Mã lỗi trong quá trình tải: " + " | ".join(error_messages[-5:]))
 
-        with st.spinner("Đang cập nhật dữ liệu. Lần đầu có thể mất vài phút do giới hạn tốc độ API..."):
+        with st.spinner("Đang cập nhật dữ liệu. Hệ thống tự giãn cách yêu cầu và thử lại khi gặp lỗi giới hạn..."):
             stock, index = load_market_data(pd.Timestamp(start), pd.Timestamp(end), api_key=api_key, progress_callback=on_progress, force_refresh=force_refresh)
         st.session_state["market_data"] = (stock, index)
         progress.progress(1.0)
         status_box.success(f"Đã sẵn sàng dữ liệu: {len(stock):,} dòng cổ phiếu và {len(index):,} dòng VNINDEX.")
         detail_box.caption("Dữ liệu đã được lưu cache theo từng mã. Lần chạy sau chỉ tải phần còn thiếu.")
     except Exception as exc:
-        status_box.error("Cập nhật dữ liệu thất bại.")
+        status_box.error("Cập nhật dữ liệu chưa hoàn tất.")
         st.exception(exc)
+        st.warning("Các mã đã tải thành công vẫn được giữ trong cache. Hãy chạy lại Cập nhật dữ liệu để tiếp tục từ phần còn thiếu; không cần bật Tải lại toàn bộ.")
         st.stop()
 
 if "market_data" not in st.session_state:
