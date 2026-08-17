@@ -6,6 +6,18 @@ import pandas as pd
 from config import FEATURES, VN30
 
 
+Z_FEATURES = [f"Z_{f}" for f in FEATURES]
+
+
+def _cross_sectional_zscore(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = frame.copy()
+    for col in columns:
+        mean = out.groupby("time")[col].transform("mean")
+        std = out.groupby("time")[col].transform("std")
+        out[f"Z_{col}"] = (out[col] - mean) / std.replace(0, np.nan)
+    return out
+
+
 def build_feature_panel(stock: pd.DataFrame, vn: pd.DataFrame) -> pd.DataFrame:
     s = stock.copy()
     i = vn.copy()
@@ -36,8 +48,13 @@ def build_feature_panel(stock: pd.DataFrame, vn: pd.DataFrame) -> pd.DataFrame:
 
     panel = pd.concat(frames, ignore_index=True)
     panel = panel.sort_values(["time", "Ticker"]).reset_index(drop=True)
+
+    # Normalize cross-sectionally by date. The resulting feature space has
+    # the same interpretation across rolling windows, unlike a StandardScaler
+    # that is re-fitted on every historical window.
+    panel = _cross_sectional_zscore(panel, FEATURES)
     return panel
 
 
 def get_feature_snapshot(panel: pd.DataFrame, date: pd.Timestamp) -> pd.DataFrame:
-    return panel[panel["time"] == pd.Timestamp(date)].dropna(subset=FEATURES).copy()
+    return panel[panel["time"] == pd.Timestamp(date)].dropna(subset=FEATURES + Z_FEATURES).copy()
