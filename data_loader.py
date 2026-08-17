@@ -7,10 +7,21 @@ from typing import Callable
 
 import pandas as pd
 
+# Use the Community package, but bypass Unified UI for the primary OHLCV
+# request. Direct KBS/VCI adapters give us a controlled fallback path when a
+# single symbol causes Unified UI to wait or fail on Streamlit Cloud.
+try:
+    from vnstock import Vnstock
+except ImportError:
+    Vnstock = None
+
 try:
     from vnstock import Market
 except ImportError:
-    from vnstock.ui import Market
+    try:
+        from vnstock.ui import Market
+    except ImportError:
+        Market = None
 
 from membership import symbols_for_period
 
@@ -18,14 +29,6 @@ CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 REQUEST_INTERVAL_SECONDS = 1.1
 _last_request_at = 0.0
-_market = None
-
-
-def _get_market():
-    global _market
-    if _market is None:
-        _market = Market()
-    return _market
 
 
 def _cache_path(symbol: str) -> Path:
@@ -98,49 +101,84 @@ def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df.assign(symbol=symbol)
 
 
+def _legacy_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp, source: str) -> pd.DataFrame:
+    if Vnstock is None:
+        raise RuntimeError("Phiên bản vnstock hiện tại không có Vnstock wrapper.")
+    stock = Vnstock().stock(symbol=symbol, source=source)
+    raw = stock.quote.history(
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        interval="1D",
+    )
+    return _normalize_ohlcv(raw, symbol)
+
+
+def _market_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    if Market is None:
+        raise RuntimeError("Không tìm thấy Market trong vnstock.")
+    raw = Market().equity(symbol).ohlcv(
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        interval="1D",
+    )
+    return _normalize_ohlcv(raw, symbol)
+
+
 def _fetch_equity(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    _rate_limit_gate()
-    started = time.monotonic()
-    try:
-        # Use the unified Market interface exactly once. Do not wrap this
-        # request in another retry loop. app.py configures vnstock's own
-        # network retry/timeout settings before importing this module.
-        raw = _get_market().equity(symbol).ohlcv(
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval="1D",
-        )
-        df = _normalize_ohlcv(raw, symbol)
-        result = df[(df["time"] >= start) & (df["time"] <= end)].copy()
-        if result.empty:
-            raise ValueError("Nguồn dữ liệu trả về nhưng không có phiên trong khoảng yêu cầu")
-        return result
-    except Exception as exc:
-        elapsed = time.monotonic() - started
-        raise RuntimeError(
-            f"VNstock lỗi {symbol} sau {elapsed:.1f} giây: {_safe_error(exc)}"
-        ) from exc
+    """Fetch one symbol with direct provider fallback.
+
+    KBS and VCI are both documented equity market sources. We try the direct
+    adapters first, then Unified UI only as a last resort. This prevents one
+    problematic Unified UI route from being the only path for the entire data
+    update.
+    """
+    errors = []
+    for source in ("KBS", "VCI"):
+        _rate_limit_gate()
+        try:
+            return _legacy_history(symbol, start, end, source)
+        except Exception as exc:
+            errors.append(f"{source}: {_safe_error(exc)}")
+
+    if Market is not None:
+        _rate_limit_gate()
+        try:
+            return _market_history(symbol, start, end)
+        except Exception as exc:
+            errors.append(f"Unified: {_safe_error(exc)}")
+
+    raise RuntimeError(f"VNstock không lấy được {symbol}: " + " | ".join(errors))
 
 
 def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    _rate_limit_gate()
-    started = time.monotonic()
-    try:
-        raw = _get_market().index("VNINDEX").ohlcv(
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval="1D",
-        )
-        df = _normalize_ohlcv(raw, "VNINDEX")
-        result = df[(df["time"] >= start) & (df["time"] <= end)].copy()
-        if result.empty:
-            raise ValueError("Nguồn dữ liệu trả về nhưng không có phiên trong khoảng yêu cầu")
-        return result
-    except Exception as exc:
-        elapsed = time.monotonic() - started
-        raise RuntimeError(
-            f"VNstock lỗi VNINDEX sau {elapsed:.1f} giây: {_safe_error(exc)}"
-        ) from exc
+    errors = []
+    if Vnstock is not None:
+        for source in ("KBS", "VCI"):
+            _rate_limit_gate()
+            try:
+                stock = Vnstock().stock(symbol="VNINDEX", source=source)
+                raw = stock.quote.history(
+                    start=start.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
+                    interval="1D",
+                )
+                return _normalize_ohlcv(raw, "VNINDEX")
+            except Exception as exc:
+                errors.append(f"{source}: {_safe_error(exc)}")
+
+    if Market is not None:
+        _rate_limit_gate()
+        try:
+            raw = Market().index("VNINDEX").ohlcv(
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                interval="1D",
+            )
+            return _normalize_ohlcv(raw, "VNINDEX")
+        except Exception as exc:
+            errors.append(f"Unified: {_safe_error(exc)}")
+
+    raise RuntimeError("VNstock không lấy được VNINDEX: " + " | ".join(errors))
 
 
 def _load_symbol(symbol: str, fetch_start: pd.Timestamp, end: pd.Timestamp, force_refresh: bool = False) -> tuple[pd.DataFrame, bool]:
@@ -205,7 +243,7 @@ def load_market_data(
     failed = []
 
     for i, symbol in enumerate(symbols, 1):
-        status = "Bỏ qua cache, đang gọi VNstock" if force_refresh else cache_status(symbol, fetch_start, end)
+        status = "Đang tải phần còn thiếu" if not force_refresh else "Đang tải lại từ VNstock"
         if progress_callback:
             progress_callback(i - 1, total, symbol, status)
         try:
@@ -217,8 +255,6 @@ def load_market_data(
             failed.append((symbol, str(exc)))
             if progress_callback:
                 progress_callback(i, total, symbol, f"LỖI: {str(exc)[:350]}")
-            # Continue to the next symbol. One bad symbol must not freeze the
-            # entire data layer.
             continue
 
     if failed:
