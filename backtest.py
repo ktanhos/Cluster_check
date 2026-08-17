@@ -75,32 +75,61 @@ def build_reference_forecast(stock: pd.DataFrame, rolling_result: pd.DataFrame, 
         state_id = int(cur["Cluster"])
         state_name = cur.get("ClusterLabel", f"Nhóm {state_id + 1}")
         migration_type = cur.get("MigrationType", "Stable")
+        transition = cur.get("Transition", "Stable")
 
-        # Use stable state ID rather than the human label because labels are generated
-        # from each window's profile and may change wording while the state ID remains aligned.
+        # Stable state IDs are safer than human labels because labels are generated
+        # from each window's profile and may change wording while IDs are aligned.
         state_hist = hist[(hist["Cluster"] == state_id) & (hist["Date"] < latest_date)].copy()
-        transition_hist = state_hist[state_hist["MigrationType"] == migration_type]
+        transition_hist = hist[(hist["Transition"] == transition) & (hist["Date"] < latest_date)].copy() if transition != "Stable" else pd.DataFrame()
 
         out = {
             "Ticker": cur["Ticker"],
             "CurrentGroup": state_name,
             "CurrentStatus": migration_type,
+            "CurrentTransition": transition,
             "Confidence": cur.get("AssignmentConfidence", np.nan),
             "HistoricalObservations": len(state_hist),
-            "SameStatusObservations": len(transition_hist),
+            "TransitionObservations": len(transition_hist),
         }
-        score_values = []
+        state_scores = []
+        transition_scores = []
         for h, c in zip(horizons, return_cols):
-            valid = state_hist[c].dropna()
-            out[f"HistoricalMean{h}D"] = valid.mean() if len(valid) else np.nan
-            out[f"HistoricalMedian{h}D"] = valid.median() if len(valid) else np.nan
-            out[f"PositiveRate{h}D"] = (valid > 0).mean() if len(valid) else np.nan
-            if len(valid) >= min_history:
-                score_values.append(float(valid.mean()))
+            state_valid = state_hist[c].dropna()
+            trans_valid = transition_hist[c].dropna()
+            out[f"HistoricalMean{h}D"] = state_valid.mean() if len(state_valid) else np.nan
+            out[f"HistoricalMedian{h}D"] = state_valid.median() if len(state_valid) else np.nan
+            out[f"PositiveRate{h}D"] = (state_valid > 0).mean() if len(state_valid) else np.nan
+            out[f"TransitionMean{h}D"] = trans_valid.mean() if len(trans_valid) else np.nan
+            if len(state_valid) >= min_history:
+                state_scores.append(float(state_valid.mean()))
             else:
-                score_values.append(np.nan)
-        available = [x for x in score_values if pd.notna(x)]
-        out["ReferenceScore"] = float(np.mean(available)) if available else np.nan
+                state_scores.append(np.nan)
+            if len(trans_valid) >= min_history:
+                transition_scores.append(float(trans_valid.mean()))
+            else:
+                transition_scores.append(np.nan)
+
+        state_available = [x for x in state_scores if pd.notna(x)]
+        trans_available = [x for x in transition_scores if pd.notna(x)]
+        state_score = float(np.mean(state_available)) if state_available else np.nan
+        transition_score = float(np.mean(trans_available)) if trans_available else np.nan
+
+        # If a current stock has enough historical examples of the same transition,
+        # prefer that more specific evidence. Otherwise fall back to its current state.
+        if pd.notna(transition_score) and len(transition_hist) >= min_history:
+            reference_score = transition_score
+            forecast_basis = "Lịch sử cùng kiểu chuyển nhóm"
+        elif pd.notna(state_score):
+            reference_score = state_score
+            forecast_basis = "Lịch sử cùng nhóm"
+        else:
+            reference_score = np.nan
+            forecast_basis = "Chưa đủ dữ liệu"
+
+        out["StateScore"] = state_score
+        out["TransitionScore"] = transition_score
+        out["ReferenceScore"] = reference_score
+        out["ForecastBasis"] = forecast_basis
         out["EnoughHistory"] = len(state_hist) >= min_history
         rows.append(out)
 
