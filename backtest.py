@@ -6,29 +6,54 @@ import pandas as pd
 from membership import membership_at
 
 
-def calculate_forward_returns(stock: pd.DataFrame, events: pd.DataFrame, horizons=(5, 10, 20)) -> pd.DataFrame:
-    """Calculate future returns after each observation or migration event.
+def _prepare_events(events: pd.DataFrame) -> pd.DataFrame:
+    """Normalize either a migration table or rolling observations.
 
-    The function preserves all event columns. This makes it usable both for the
-    migration event study and for the historical reference forecast. Rows for
-    which the stock is not an active VN30 constituent are excluded.
+    The app historically passed rolling_result to calculate_forward_returns.
+    Convert that input into an event table here so the analysis remains backward
+    compatible and never depends on a fragile column existing upstream.
     """
     if events is None or events.empty:
         return pd.DataFrame()
+    x = events.copy()
+    if "Ticker" not in x.columns or "Date" not in x.columns:
+        return pd.DataFrame()
+    x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
+    x = x.dropna(subset=["Date", "Ticker"]).sort_values(["Ticker", "Date"]).copy()
+    if "Migration" not in x.columns:
+        if "Cluster" in x.columns:
+            previous = x.groupby("Ticker")["Cluster"].shift(1)
+            x["Migration"] = previous.notna() & previous.ne(x["Cluster"])
+            x["Transition"] = np.where(
+                x["Migration"],
+                previous.astype("Int64").astype(str) + " → " + x["Cluster"].astype("Int64").astype(str),
+                "Stable",
+            )
+        else:
+            x["Migration"] = False
+    if "Transition" not in x.columns:
+        x["Transition"] = "Stable"
+    return x
+
+
+def calculate_forward_returns(stock: pd.DataFrame, events: pd.DataFrame, horizons=(5, 10, 20)) -> pd.DataFrame:
+    """Calculate future returns after observations, including migration events."""
+    events = _prepare_events(events)
+    if events.empty:
+        return pd.DataFrame()
 
     s = stock.copy().sort_values(["symbol", "time"])
+    s["symbol"] = s["symbol"].astype(str)
     close = s[["symbol", "time", "close"]].copy()
     rows = []
     for _, r in events.iterrows():
-        if pd.isna(r.get("Date")) or pd.isna(r.get("Ticker")):
-            continue
         event_date = pd.Timestamp(r["Date"])
         ticker = str(r["Ticker"])
-        active_at_event = ticker in membership_at(event_date)
-        px = close[(close["symbol"].astype(str) == ticker) & (close["time"] >= event_date)].sort_values("time")
-        if px.empty or not active_at_event:
+        if ticker not in membership_at(event_date):
             continue
-
+        px = close[(close["symbol"] == ticker) & (close["time"] >= event_date)].sort_values("time")
+        if px.empty:
+            continue
         base = px.iloc[0]["close"]
         out = r.to_dict()
         out["ConstituentAtEvent"] = True
@@ -41,40 +66,28 @@ def calculate_forward_returns(stock: pd.DataFrame, events: pd.DataFrame, horizon
                 out[f"ConstituentThrough{h}D"] = False
                 out[f"ForwardReturn{h}D"] = np.nan
         rows.append(out)
-
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def summarize_forward_returns(forward: pd.DataFrame) -> pd.DataFrame:
-    """Summarize future returns only for actual migration events.
-
-    Older app states could produce a nonempty DataFrame without a Migration
-    column. That must be treated as no migration events rather than raising a
-    KeyError and stopping the whole application.
-    """
+    """Summarize future returns for actual migration events without KeyError."""
     if forward is None or forward.empty:
         return pd.DataFrame()
-
-    x = forward.copy()
-    if "Migration" not in x.columns:
-        x["Migration"] = False
-    if "Transition" not in x.columns:
-        x["Transition"] = "Stable"
-
+    x = _prepare_events(forward)
+    if x.empty or "Migration" not in x.columns:
+        return pd.DataFrame()
     events = x[x["Migration"].fillna(False).astype(bool)].copy()
     if events.empty:
         return pd.DataFrame(columns=["Transition", "Events"])
 
-    cols = [c for c in x.columns if c.startswith("ForwardReturn")]
+    cols = [c for c in events.columns if c.startswith("ForwardReturn")]
     rows = []
     for transition, g in events.groupby("Transition", dropna=True):
         row = {"Transition": transition, "Events": len(g)}
         for c in cols:
             horizon = c.replace("ForwardReturn", "")
             membership_col = f"ConstituentThrough{horizon}"
-            valid = g[g[membership_col].fillna(False)] if membership_col in g else g
+            valid = g[g[membership_col].fillna(False)] if membership_col in g.columns else g
             valid = valid[valid[c].notna()]
             row[f"{c}_EventsInBasket"] = len(valid)
             row[f"{c}_Mean"] = valid[c].mean() if len(valid) else np.nan
@@ -85,21 +98,16 @@ def summarize_forward_returns(forward: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_reference_forecast(stock: pd.DataFrame, rolling_result: pd.DataFrame, horizons=(5, 10, 20), min_history: int = 5) -> pd.DataFrame:
-    """Descriptive historical conditional-return ranking, not a predictive model.
-
-    For each current VN30 stock, compare historical observations with the same
-    behavior group and, when enough observations exist, the same migration path.
-    The result is a reference ranking, not a claim about future price.
-    """
+    """Descriptive historical conditional-return ranking, not a predictive model."""
     if rolling_result is None or rolling_result.empty:
         return pd.DataFrame()
 
     hist = calculate_forward_returns(stock, rolling_result, horizons=horizons)
     if hist.empty:
         return pd.DataFrame()
-
     hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
     latest_date = hist["Date"].max()
+
     current = rolling_result.copy()
     current["Date"] = pd.to_datetime(current["Date"], errors="coerce")
     current_date = current["Date"].max()
@@ -112,8 +120,8 @@ def build_reference_forecast(stock: pd.DataFrame, rolling_result: pd.DataFrame, 
         state_id = int(cur["Cluster"])
         state_name = cur.get("ClusterLabel", f"Nhóm {state_id + 1}")
         transition = cur.get("Transition", "Stable")
-        state_hist = hist[(hist["Cluster"] == state_id) & (hist["Date"] < latest_date)].copy()
-        transition_hist = hist[(hist.get("Transition", pd.Series(index=hist.index, dtype=object)) == transition) & (hist["Date"] < latest_date)].copy() if transition != "Stable" and "Transition" in hist.columns else pd.DataFrame()
+        state_hist = hist[(hist["Cluster"] == state_id) & (hist["Date"] < latest_date)].copy() if "Cluster" in hist.columns else pd.DataFrame()
+        transition_hist = hist[(hist["Transition"] == transition) & (hist["Date"] < latest_date)].copy() if transition != "Stable" else pd.DataFrame()
 
         out = {
             "Ticker": cur["Ticker"],
