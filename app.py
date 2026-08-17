@@ -3,6 +3,8 @@ import os
 import pandas as pd
 import streamlit as st
 
+APP_VERSION = "DATA-LAYER-TEST-2026-08-17-01"
+
 try:
     from vnstock.config import Config
     Config.REQUEST_TIMEOUT = 15
@@ -24,6 +26,7 @@ from migration import build_migration_table
 st.set_page_config(page_title="VN30 Rolling Behavior Clustering", layout="wide")
 st.title("VN30 Rolling Market Behavior Clustering")
 st.caption("Lớp dữ liệu và lớp mô hình được tách riêng. VNstock chỉ được gọi khi bấm Cập nhật dữ liệu. Sau đó có thể chạy nhiều cấu hình mô hình mà không gọi API lại.")
+st.caption(f"Phiên bản Data Layer: {APP_VERSION}")
 
 with st.sidebar:
     st.subheader("Xác thực VNstock")
