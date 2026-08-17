@@ -5,7 +5,16 @@ import time
 from pathlib import Path
 
 import pandas as pd
-from vnstock import Market, register_user
+
+try:
+    from vnstock import Market
+except ImportError:
+    from vnstock.ui import Market
+
+try:
+    from vnstock import register_user
+except ImportError:
+    register_user = None
 
 from membership import symbols_for_period
 
@@ -40,10 +49,11 @@ def _configure_vnstock(api_key: str | None = None) -> None:
     if not key:
         raise ValueError("Thiếu VNstock API Key.")
     os.environ["VNSTOCK_API_KEY"] = key
-    try:
-        register_user(api_key=key)
-    except TypeError:
-        pass
+    if register_user is not None:
+        try:
+            register_user(api_key=key)
+        except TypeError:
+            pass
 
 
 def _rate_limit_gate() -> None:
@@ -65,10 +75,7 @@ def _call_with_retry(fetch_fn, symbol: str) -> pd.DataFrame:
             if attempt < MAX_FETCH_RETRIES:
                 time.sleep(min(20.0, 2.0 ** (attempt - 1) * 2.0))
     error_type = type(last_error).__name__ if last_error is not None else "UnknownError"
-    error_text = str(last_error)[:300] if last_error else ""
-    key = os.getenv("VNSTOCK_API_KEY", "").strip()
-    if key:
-        error_text = error_text.replace(key, "[API_KEY]")
+    error_text = str(last_error).replace(os.getenv("VNSTOCK_API_KEY", ""), "[API_KEY]")[:300] if last_error else ""
     raise RuntimeError(f"VNstock lỗi với {symbol} sau {MAX_FETCH_RETRIES} lần thử. Loại lỗi: {error_type}. Chi tiết: {error_text}") from last_error
 
 
