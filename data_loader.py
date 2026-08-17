@@ -1,61 +1,111 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
-import signal
 import time
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 
-# Community package. Direct adapters are used before Unified UI so a single
-# problematic symbol cannot keep the entire Streamlit data update waiting.
-try:
-    from vnstock import Vnstock
-except ImportError:
-    Vnstock = None
-
-try:
-    from vnstock import Market
-except ImportError:
-    try:
-        from vnstock.ui import Market
-    except ImportError:
-        Market = None
-
 from membership import symbols_for_period
 
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 REQUEST_INTERVAL_SECONDS = 1.1
-REQUEST_TIMEOUT_SECONDS = 18
-_last_request_at = 0.0
+REQUEST_TIMEOUT_SECONDS = 25
 
 
-class RequestTimeout(BaseException):
-    """Timeout deliberately outside Exception so vnstock retry wrappers cannot swallow it."""
+class WorkerTimeout(Exception):
+    pass
 
 
-def _timeout_handler(signum, frame):
-    raise RequestTimeout()
+def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        raise ValueError(f"Không có dữ liệu cho {symbol}")
+    df = raw.copy().rename(columns={"date": "time", "Date": "time"})
+    required = ["time", "open", "high", "low", "close", "volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Thiếu cột {missing} cho {symbol}")
+    df = df[required].copy()
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.dropna(subset=["time", "close"], inplace=True)
+    return df.assign(symbol=symbol)
 
 
-def _call_with_timeout(fn, seconds: int = REQUEST_TIMEOUT_SECONDS):
-    """Run one network call with a hard timeout on Streamlit Cloud/Linux.
+def _worker_equity(queue, symbol: str, start: str, end: str, source: str, api_key: str):
+    """Run VNstock in a real child process.
 
-    signal is only used on the main thread. On Windows or environments where
-    SIGALRM is unavailable, the call simply uses the library's normal timeout.
+    Streamlit executes the user script in a worker thread rather than the
+    interpreter main thread. VNstock's internal timeout implementation uses
+    signal.signal, which Python only permits in the main thread. A child
+    process gives VNstock an actual interpreter main thread and therefore
+    avoids: "signal only works in main thread of the main interpreter".
     """
-    if not hasattr(signal, "SIGALRM"):
-        return fn()
-    previous_handler = signal.getsignal(signal.SIGALRM)
     try:
-        signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.setitimer(signal.ITIMER_REAL, seconds)
-        return fn()
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
+        os.environ["VNSTOCK_API_KEY"] = api_key
+        try:
+            from vnstock.config import Config
+            Config.REQUEST_TIMEOUT = 15
+            Config.RETRIES = 1
+            Config.BACKOFF_MIN = 1
+            Config.BACKOFF_MAX = 2
+        except Exception:
+            pass
+
+        from vnstock import Vnstock
+
+        stock = Vnstock().stock(symbol=symbol, source=source)
+        raw = stock.quote.history(start=start, end=end, interval="1D")
+        queue.put((True, _normalize_ohlcv(raw, symbol), ""))
+    except BaseException as exc:
+        queue.put((False, None, f"{type(exc).__name__}: {str(exc)[:500]}"))
+
+
+def _worker_index(queue, start: str, end: str, source: str, api_key: str):
+    try:
+        os.environ["VNSTOCK_API_KEY"] = api_key
+        try:
+            from vnstock.config import Config
+            Config.REQUEST_TIMEOUT = 15
+            Config.RETRIES = 1
+            Config.BACKOFF_MIN = 1
+            Config.BACKOFF_MAX = 2
+        except Exception:
+            pass
+
+        from vnstock import Vnstock
+
+        stock = Vnstock().stock(symbol="VNINDEX", source=source)
+        raw = stock.quote.history(start=start, end=end, interval="1D")
+        queue.put((True, _normalize_ohlcv(raw, "VNINDEX"), ""))
+    except BaseException as exc:
+        queue.put((False, None, f"{type(exc).__name__}: {str(exc)[:500]}"))
+
+
+def _run_worker(target, args, timeout: int = REQUEST_TIMEOUT_SECONDS):
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    process = ctx.Process(target=target, args=(queue, *args))
+    process.daemon = True
+    process.start()
+    process.join(timeout)
+
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+        return None, f"timeout {timeout}s"
+
+    if queue.empty():
+        return None, f"worker exited with code {process.exitcode} without a result"
+
+    ok, data, error = queue.get()
+    if ok:
+        return data, ""
+    return None, error
 
 
 def _cache_path(symbol: str) -> Path:
@@ -100,11 +150,11 @@ def _configure_vnstock(api_key: str | None = None) -> None:
 
 
 def _rate_limit_gate() -> None:
-    global _last_request_at
-    wait = REQUEST_INTERVAL_SECONDS - (time.monotonic() - _last_request_at)
+    state = getattr(_rate_limit_gate, "state", 0.0)
+    wait = REQUEST_INTERVAL_SECONDS - (time.monotonic() - state)
     if wait > 0:
         time.sleep(wait)
-    _last_request_at = time.monotonic()
+    _rate_limit_gate.state = time.monotonic()
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -112,109 +162,31 @@ def _safe_error(exc: BaseException) -> str:
     return str(exc).replace(key, "[API_KEY]")[:500]
 
 
-def _normalize_ohlcv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    if raw is None or raw.empty:
-        raise ValueError(f"Không có dữ liệu cho {symbol}")
-    df = raw.copy().rename(columns={"date": "time", "Date": "time"})
-    required = ["time", "open", "high", "low", "close", "volume"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Thiếu cột {missing} cho {symbol}")
-    df = df[required].copy()
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df.dropna(subset=["time", "close"], inplace=True)
-    return df.assign(symbol=symbol)
-
-
-def _legacy_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp, source: str) -> pd.DataFrame:
-    if Vnstock is None:
-        raise RuntimeError("Phiên bản vnstock hiện tại không có Vnstock wrapper.")
-    stock = Vnstock().stock(symbol=symbol, source=source)
-    raw = _call_with_timeout(
-        lambda: stock.quote.history(
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval="1D",
-        )
-    )
-    return _normalize_ohlcv(raw, symbol)
-
-
-def _market_history(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    if Market is None:
-        raise RuntimeError("Không tìm thấy Market trong vnstock.")
-    raw = _call_with_timeout(
-        lambda: Market().equity(symbol).ohlcv(
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval="1D",
-        )
-    )
-    return _normalize_ohlcv(raw, symbol)
-
-
 def _fetch_equity(symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     errors = []
     for source in ("KBS", "VCI"):
         _rate_limit_gate()
-        try:
-            return _legacy_history(symbol, start, end, source)
-        except RequestTimeout:
-            errors.append(f"{source}: timeout {REQUEST_TIMEOUT_SECONDS}s")
-        except Exception as exc:
-            errors.append(f"{source}: {_safe_error(exc)}")
-
-    # Final fallback for installations where the legacy adapter is unavailable.
-    if Market is not None:
-        _rate_limit_gate()
-        try:
-            return _market_history(symbol, start, end)
-        except RequestTimeout:
-            errors.append(f"Unified: timeout {REQUEST_TIMEOUT_SECONDS}s")
-        except Exception as exc:
-            errors.append(f"Unified: {_safe_error(exc)}")
-
+        data, error = _run_worker(
+            _worker_equity,
+            (symbol, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), source, os.getenv("VNSTOCK_API_KEY", "")),
+        )
+        if data is not None:
+            return data
+        errors.append(f"{source}: {error}")
     raise RuntimeError(f"VNstock không lấy được {symbol}: " + " | ".join(errors))
 
 
 def _fetch_index(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     errors = []
-    if Vnstock is not None:
-        for source in ("KBS", "VCI"):
-            _rate_limit_gate()
-            try:
-                stock = Vnstock().stock(symbol="VNINDEX", source=source)
-                raw = _call_with_timeout(
-                    lambda: stock.quote.history(
-                        start=start.strftime("%Y-%m-%d"),
-                        end=end.strftime("%Y-%m-%d"),
-                        interval="1D",
-                    )
-                )
-                return _normalize_ohlcv(raw, "VNINDEX")
-            except RequestTimeout:
-                errors.append(f"{source}: timeout {REQUEST_TIMEOUT_SECONDS}s")
-            except Exception as exc:
-                errors.append(f"{source}: {_safe_error(exc)}")
-
-    if Market is not None:
+    for source in ("KBS", "VCI"):
         _rate_limit_gate()
-        try:
-            raw = _call_with_timeout(
-                lambda: Market().index("VNINDEX").ohlcv(
-                    start=start.strftime("%Y-%m-%d"),
-                    end=end.strftime("%Y-%m-%d"),
-                    interval="1D",
-                )
-            )
-            return _normalize_ohlcv(raw, "VNINDEX")
-        except RequestTimeout:
-            errors.append(f"Unified: timeout {REQUEST_TIMEOUT_SECONDS}s")
-        except Exception as exc:
-            errors.append(f"Unified: {_safe_error(exc)}")
-
+        data, error = _run_worker(
+            _worker_index,
+            (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), source, os.getenv("VNSTOCK_API_KEY", "")),
+        )
+        if data is not None:
+            return data
+        errors.append(f"{source}: {error}")
     raise RuntimeError("VNstock không lấy được VNINDEX: " + " | ".join(errors))
 
 
@@ -280,18 +252,17 @@ def load_market_data(
     failed = []
 
     for i, symbol in enumerate(symbols, 1):
-        status = "Đang tải phần còn thiếu" if not force_refresh else "Đang tải lại từ VNstock"
         if progress_callback:
-            progress_callback(i - 1, total, symbol, status)
+            progress_callback(i - 1, total, symbol, "Kiểm tra cache")
         try:
             frame, fetched = _load_symbol(symbol, fetch_start, end, force_refresh=force_refresh)
             stock_frames.append(frame)
             if progress_callback:
                 progress_callback(i, total, symbol, "Đã tải API" if fetched else "Dùng cache")
-        except BaseException as exc:
-            failed.append((symbol, str(exc) or "Request timeout"))
+        except Exception as exc:
+            failed.append((symbol, _safe_error(exc)))
             if progress_callback:
-                progress_callback(i, total, symbol, f"LỖI: {str(exc)[:350] or 'Request timeout'}")
+                progress_callback(i, total, symbol, f"LỖI: {_safe_error(exc)}")
             continue
 
     if failed:
